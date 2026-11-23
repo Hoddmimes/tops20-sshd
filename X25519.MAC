@@ -1,0 +1,151 @@
+	TITLE	X25519 - Curve25519 Diffie-Hellman for TOPS-20
+
+;RFC 7748 X25519, Montgomery ladder with constant-time swaps.
+;
+;Call (clobbers T1-T4 only):
+;  T1/ out (32 bytes)  T2/ scalar (32 bytes)  T3/ u (32 bytes)
+;                                                  CALL X25519
+;Bytes are one per word.  The public key for a private scalar k is
+;X25519(k, 9).
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	X25519
+	EXTERN	FMUL,FSQ,FADD,FSUB,FCOPY,FINV,FZERO,FONE
+	EXTERN	FCSWAP,FTOBYT,FFRBYT
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	TBIT=5			;Bit index t, 254..0
+	SWAP=6			;Pending swap flag
+	KT=7			;Current scalar bit
+	OUTP=10			;Output address
+	P=17
+
+KB:	BLOCK	^D32		;Clamped scalar
+X1:	BLOCK	12		;Field elements
+X2:	BLOCK	12
+Z2:	BLOCK	12
+X3:	BLOCK	12
+Z3:	BLOCK	12
+XA:	BLOCK	12
+XAA:	BLOCK	12
+XB:	BLOCK	12
+XBB:	BLOCK	12
+XE:	BLOCK	12
+XC:	BLOCK	12
+XD:	BLOCK	12
+XDA:	BLOCK	12
+XCB:	BLOCK	12
+XT:	BLOCK	12
+A24:	^D121665		;(486662 - 2) / 4
+	BLOCK	11
+
+;F3 OP,H,F,G - call a three-operand field routine
+;F2 OP,H,F   - call a two-operand field routine
+
+DEFINE	F3(OP,H,F,G),<
+	MOVEI	T1,H
+	MOVEI	T2,F
+	MOVEI	T3,G
+	CALL	OP
+>
+DEFINE	F2(OP,H,F),<
+	MOVEI	T1,H
+	MOVEI	T2,F
+	CALL	OP
+>
+
+X25519:	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,10
+	MOVE	OUTP,T1
+	MOVSI	T4,-^D32	;Copy and clamp the scalar
+X2551:	MOVE	T1,(T2)
+	ANDI	T1,377
+	MOVEM	T1,KB(T4)
+	ADDI	T2,1
+	AOBJN	T4,X2551
+	MOVEI	T1,370
+	ANDM	T1,KB
+	MOVEI	T1,177
+	ANDM	T1,KB+^D31
+	MOVEI	T1,100
+	IORM	T1,KB+^D31
+	MOVEI	T1,X1		;x1 = u
+	MOVE	T2,T3
+	CALL	FFRBYT
+	MOVEI	T1,X2		;x2 = 1, z2 = 0, x3 = u, z3 = 1
+	CALL	FONE
+	MOVEI	T1,Z2
+	CALL	FZERO
+	F2	FCOPY,X3,X1
+	MOVEI	T1,Z3
+	CALL	FONE
+	SETZ	SWAP,
+	MOVEI	TBIT,^D254
+
+LADDER:	MOVE	T1,TBIT		;k_t = bit t of the scalar
+	LSH	T1,-3
+	MOVE	KT,KB(T1)
+	MOVE	T1,TBIT
+	ANDI	T1,7
+	MOVN	T1,T1
+	LSH	KT,(T1)
+	ANDI	KT,1
+	XOR	SWAP,KT		;swap ^= k_t
+	MOVEI	T1,X2
+	MOVEI	T2,X3
+	MOVE	T3,SWAP
+	CALL	FCSWAP
+	MOVEI	T1,Z2
+	MOVEI	T2,Z3
+	MOVE	T3,SWAP
+	CALL	FCSWAP
+	MOVE	SWAP,KT
+	F3	FADD,XA,X2,Z2	;A = x2 + z2
+	F2	FSQ,XAA,XA	;AA = A^2
+	F3	FSUB,XB,X2,Z2	;B = x2 - z2
+	F2	FSQ,XBB,XB	;BB = B^2
+	F3	FSUB,XE,XAA,XBB	;E = AA - BB
+	F3	FADD,XC,X3,Z3	;C = x3 + z3
+	F3	FSUB,XD,X3,Z3	;D = x3 - z3
+	F3	FMUL,XDA,XD,XA	;DA = D * A
+	F3	FMUL,XCB,XC,XB	;CB = C * B
+	F3	FADD,XT,XDA,XCB	;x3 = (DA + CB)^2
+	F2	FSQ,X3,XT
+	F3	FSUB,XT,XDA,XCB	;z3 = x1 * (DA - CB)^2
+	F2	FSQ,XT,XT
+	F3	FMUL,Z3,X1,XT
+	F3	FMUL,X2,XAA,XBB	;x2 = AA * BB
+	F3	FMUL,XT,XE,A24	;z2 = E * (AA + a24 * E)
+	F3	FADD,XT,XAA,XT
+	F3	FMUL,Z2,XE,XT
+	SOJGE	TBIT,LADDER
+
+	MOVEI	T1,X2		;Final swap
+	MOVEI	T2,X3
+	MOVE	T3,SWAP
+	CALL	FCSWAP
+	MOVEI	T1,Z2
+	MOVEI	T2,Z3
+	MOVE	T3,SWAP
+	CALL	FCSWAP
+	F2	FINV,Z2,Z2	;Result = x2 / z2
+	F3	FMUL,X2,X2,Z2
+	MOVE	T1,OUTP
+	MOVEI	T2,X2
+	CALL	FTOBYT
+	POP	P,10
+	POP	P,7
+	POP	P,6
+	POP	P,5
+	RET
+
+	LIT
+
+	END

@@ -1,0 +1,1103 @@
+	TITLE	SSHSCP - TOPS-20 SSH server: scp (classic protocol)
+
+;Only assembled into the server with FTSCP==1 in SSHDEF (and SSHSCP in
+;the LOAD list of tools/build.py); FTSCP==0 leaves scp out entirely.
+;
+;Classic scp: "scp -O" with OpenSSH 9.0 and later (which otherwise use
+;SFTP, not supported), plain scp with older OpenSSH, pscp.  The client
+;sends exec "scp -t <target>" (upload) or "scp -f <files>" (download)
+;and talks the rcp protocol on the channel.  This module plays the
+;remote scp itself; nothing runs in the user's job.
+;
+;ACCESS: the server runs as SSHD with WHEEL available.  Every file is
+;checked with CHKAC% for the logged-in user (with no capabilities)
+;before it is opened, and WHEEL is enabled only around GTJFN%, OPENF%
+;and DELF%.
+;
+;Files: 7-bit (text) files are sent with CRLF -> LF; 8-bit files as
+;they are; other byte sizes (36-bit: .EXE, .REL ...) are refused.  An
+;upload is written as an 8-bit file; if it turns out to be all 7-bit
+;ASCII it is rewritten as a 7-bit text file with LF -> CRLF.  Names
+;are upper-cased; plain names and "." are relative to PS:<user>.
+;Wildcards work for downloads.  Directories (scp -r) are refused.
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	CAPON,CAPOFF,ERRMSG,DECOUT,R,RSKP
+	EXTERN	UNAM,RCVPKT,DISPAT,SNDPKT,OPB,OP32,OSTR,OLEN
+	EXTERN	RCHAN,RWIN,RMAXP,LGDEAD
+	INTERN	SCPREQ,SCPRUN,SCPDAT,SCPMOD,SCPGO,SLOST
+	EXTERN	CEOF,EXCODE
+
+IBMAX==^D40000			;Received data buffer (> our window)
+OBMAX==^D4000			;Output collected per data packet
+RBMAX==^D4000			;File read block (bytes)
+WBMAX==^D4000			;File write block (bytes)
+
+SCPMOD:	BLOCK	1		;0 none, 1 sink (-t, upload), 2 source (-f)
+SCPGO:	BLOCK	1		;Accepted, not run yet
+SCPREC:	BLOCK	1		;-r given
+SFAIL:	BLOCK	1		;Some file failed (exit status 1)
+SLOST:	BLOCK	1		;Connection lost
+NOOPT:	BLOCK	1		;After "--"
+QST:	BLOCK	1		;Quote being parsed (0 = none)
+ISDIR:	BLOCK	1		;Upload target is a directory
+UNUM:	BLOCK	1		;User number of the logged-in user
+UDIR:	BLOCK	1		; and of PS:<user>
+CKBLK:	BLOCK	6		;CHKAC% argument block
+FJFN:	BLOCK	1		;File being read or written
+TJFN:	BLOCK	1		;Text version being written
+GJFN:	BLOCK	1		;Wildcard JFN (downloads)
+FSIZE:	BLOCK	1		;File size (bytes)
+FCNT:	BLOCK	1		;Bytes to send (text: after CRLF -> LF)
+FBSZ:	BLOCK	1		;File byte size
+ALL7:	BLOCK	1		;Upload so far all 7-bit
+WERR:	BLOCK	1		;Write error during an upload
+PCR:	BLOCK	1		;A CR is pending (download conversion)
+IBW:	BLOCK	1		;IBUF: bytes in it
+IBR:	BLOCK	1		; and bytes taken
+OCNT:	BLOCK	1		;OBYT: bytes in it
+SFOFF:	BLOCK	1		;SCPFL: bytes sent so far
+FLEFT:	BLOCK	1		;Bytes of a file still to move
+RJFN:	BLOCK	1		;Block reading: file
+RPTR0:	BLOCK	1		; byte pointer to RBUF's start
+RPTR:	BLOCK	1		; next byte
+RCNT:	BLOCK	1		; bytes left in RBUF
+RREQ:	BLOCK	1		; bytes asked for
+WJFN:	BLOCK	1		;Block writing: file
+WPTR0:	BLOCK	1		; byte pointer to WBUF's start
+WPTR:	BLOCK	1		; next byte
+WCNT:	BLOCK	1		; bytes in WBUF
+RBUF:	BLOCK	RBMAX/4+1	;File blocks (8-bit: 4 per word, 7-bit: 5)
+WBUF:	BLOCK	WBMAX/4+1
+SCPPTH:	BLOCK	50		;Path from the command (ASCIZ)
+DNAM:	BLOCK	20		;"PS:<user>"
+TDIR:	BLOCK	50		;Upload: target directory (ASCIZ)
+TNAM:	BLOCK	50		;File name being worked on (full)
+FNM:	BLOCK	30		;File name from a C line / for messages
+SLIN:	BLOCK	310		;Command / protocol line (ASCIZ, 1000 ch)
+MBUF:	BLOCK	60		;Message being built
+NBUF:	BLOCK	4		;Number as text
+IBUF:	BLOCK	IBMAX		;Received bytes, one per word
+OBYT:	BLOCK	OBMAX		;Bytes to send, one per word
+
+	SUBTTL	The exec request
+
+;SCPREQ - T2/T3 = exec command in PAY.  Skip return if it is an scp
+;command we can do (SCPGO set), else non-skip.
+
+SCPREQ:	PUSH	P,Q1
+	CAILE	T3,^D990
+	 JRST	SCPRQN
+	MOVE	T1,[POINT 7,SLIN] ;Copy as ASCIZ
+SCPRQ1:	SOJL	T3,SCPRQ2
+	MOVE	T4,(T2)
+	ANDI	T4,177
+	IDPB	T4,T1
+	AOJA	T2,SCPRQ1
+SCPRQ2:	SETZ	T4,
+	IDPB	T4,T1
+	SETZM	SCPMOD
+	SETZM	SCPREC
+	SETZM	NOOPT
+	SETZM	SCPPTH
+	MOVE	Q1,[POINT 7,SLIN] ;"scp "
+	CALL	SKSPC
+	CAIE	T1,"s"
+	 JRST	SCPRQN
+	ILDB	T1,Q1
+	CAIE	T1,"c"
+	 JRST	SCPRQN
+	ILDB	T1,Q1
+	CAIE	T1,"p"
+	 JRST	SCPRQN
+	ILDB	T1,Q1
+	CAIE	T1," "
+	 JRST	SCPRQN
+SCPRQ3:	CALL	SKSPC		;Next word: an option or the path
+	JUMPE	T1,SCPRQX
+	SKIPE	NOOPT
+	 JRST	SCPRQ6
+	CAIE	T1,"-"
+	 JRST	SCPRQ6
+	ILDB	T1,Q1
+	CAIE	T1,"-"		;"--": no more options
+	 JRST	SCPRQ4
+	SETOM	NOOPT
+	ILDB	T1,Q1
+	JUMPE	T1,SCPRQX
+	JRST	SCPRQ3
+SCPRQ4:	JUMPE	T1,SCPRQX	;Option letters
+	CAIN	T1," "
+	 JRST	SCPRQ3
+	CAIN	T1,"t"
+	 JRST	[MOVEI	T2,1
+		 MOVEM	T2,SCPMOD
+		 JRST	SCPRQ5]
+	CAIN	T1,"f"
+	 JRST	[MOVEI	T2,2
+		 MOVEM	T2,SCPMOD
+		 JRST	SCPRQ5]
+	CAIN	T1,"r"
+	 SETOM	SCPREC
+SCPRQ5:	ILDB	T1,Q1		;(d, p, v, q: nothing to do)
+	JRST	SCPRQ4
+
+SCPRQ6:	MOVE	T3,[POINT 7,SCPPTH] ;The path: undo shell quoting
+	MOVEI	T4,^D195
+	SETZM	QST
+SCPRQ7:	JUMPE	T1,SCPRQ9
+	SKIPE	QST
+	 JRST	SCPRQA
+	CAIN	T1," "		;Unquoted space: end of the (first) path
+	 JRST	SCPRQ9
+	CAIE	T1,47		;' or " opens a quote
+	 CAIN	T1,42
+	  JRST	[MOVEM	T1,QST
+		 JRST	SCPRQB]
+	CAIE	T1,134		;Backslash: take the next one as it is
+	 JRST	SCPRQC
+	ILDB	T1,Q1
+	JUMPE	T1,SCPRQ9
+	JRST	SCPRQC
+SCPRQA:	CAMN	T1,QST		;Closing quote
+	 JRST	[SETZM	QST
+		 JRST	SCPRQB]
+SCPRQC:	SOJL	T4,SCPRQN	;Too long
+	IDPB	T1,T3
+SCPRQB:	ILDB	T1,Q1
+	JRST	SCPRQ7
+SCPRQ9:	SETZ	T1,
+	IDPB	T1,T3
+
+SCPRQX:	SKIPN	SCPMOD		;-t or -f is needed
+	 JRST	SCPRQN
+	MOVX	T1,RC%EMO	;The user's numbers, for CHKAC%
+	HRROI	T2,UNAM
+	RCUSR%
+	 ERJMP	SCPRQN
+	TXNE	T1,RC%NOM!RC%AMB
+	 JRST	SCPRQN
+	MOVEM	T3,UNUM
+	HRROI	T1,DNAM		;"PS:<user>"
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	HRROI	T2,UNAM
+	SOUT%
+	MOVEI	T2,">"
+	IDPB	T2,T1
+	IDPB	T3,T1
+	MOVX	T1,RC%EMO
+	HRROI	T2,DNAM
+	RCDIR%
+	 ERJMP	SCPRQN
+	TXNE	T1,RC%NOM!RC%AMB
+	 JRST	SCPRQN
+	MOVEM	T3,UDIR
+	SETOM	SCPGO
+	SETZM	CEOF
+	SETZM	SFAIL
+	SETZM	SLOST
+	SETZM	IBW
+	SETZM	IBR
+	SETZM	OCNT
+	SETZM	EXCODE
+	POP	P,Q1
+	RETSKP
+SCPRQN:	SETZM	SCPMOD
+	POP	P,Q1
+	RET
+
+;SKSPC - T1 := next character at Q1 that is not a space
+
+SKSPC:	ILDB	T1,Q1
+	CAIN	T1," "
+	 JRST	SKSPC
+	RET
+
+	SUBTTL	Running scp
+
+;SCPRUN - do the transfer; EXCODE = exit status for the caller to send
+
+SCPRUN:	SETZM	SCPGO
+	PUSH	P,Q1
+	PUSH	P,Q2
+	PUSH	P,Q3
+	TMSG	<[scp >
+	HRROI	T1,[ASCIZ /upload to /]
+	MOVE	T2,SCPMOD
+	CAIE	T2,1
+	 HRROI	T1,[ASCIZ /download of /]
+	PSOUT%
+	HRROI	T1,SCPPTH
+	PSOUT%
+	TMSG	<]
+>
+	MOVE	T1,SCPMOD
+	CAIN	T1,1
+	 CALL	SCPSNK
+	MOVE	T1,SCPMOD
+	CAIN	T1,2
+	 CALL	SCPSRC
+	CALL	SCPFL
+	SETZ	T1,		;exit-status 0, or 1 if something failed
+	SKIPE	SFAIL
+	 MOVEI	T1,1
+	MOVEM	T1,EXCODE
+	SETZM	SCPMOD		;(Further data: discarded)
+	POP	P,Q3
+	POP	P,Q2
+	POP	P,Q1
+	RET
+
+	SUBTTL	Upload (scp -t)
+
+SCPSNK:	SETZM	ISDIR		;Where to?  A directory, or a file name
+	HRROI	T1,TDIR
+	HRROI	T2,DNAM
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	LDB	T1,[POINT 7,SCPPTH,6]
+	JUMPE	T1,SNKD		;No path: PS:<user>
+	MOVE	T1,SCPPTH
+	CAMN	T1,[ASCIZ /./]	;"."
+	 JRST	SNKD
+	MOVE	T1,[POINT 7,SCPPTH] ;Last character
+	SETZ	T3,
+SNK0:	ILDB	T2,T1
+	JUMPE	T2,SNK0A
+	MOVE	T3,T2
+	JRST	SNK0
+SNK0A:	CAIE	T3,">"		;Ends in > or : - a directory
+	 CAIN	T3,":"
+	  JRST	[HRROI	T1,TDIR
+		 HRROI	T2,SCPPTH
+		 SETZ	T3,
+		 SOUT%
+		 IDPB	T3,T1
+		 JRST	SNKD]
+	HRROI	T1,TNAM		;A file name (relative to PS:<user>)
+	HRROI	T2,SCPPTH
+	CALL	FULNAM
+	JRST	SNK1
+SNKD:	SETOM	ISDIR
+SNK1:	CALL	SCPOK		;Ready
+SNK2:	SKIPE	SLOST
+	 RET
+	CALL	SCPGL		;Next protocol line
+	 RET			;End: the client is done
+	LDB	T1,[POINT 7,SLIN,6]
+	CAIE	T1,"T"		;Times: not used
+	 CAIN	T1,"E"		;End of directory
+	  JRST	[CALL	SCPOK
+		 JRST	SNK2]
+	CAIN	T1,"C"
+	 JRST	[CALL	SNKFIL
+		 JRST	SNK2]
+	CAIN	T1,"D"
+	 JRST	[HRROI	T2,[ASCIZ /directories are not supported (scp -r)/]
+		 MOVEI	T1,2
+		 JRST	SCPERR]
+	CAIE	T1,1		;Error from the client
+	 CAIN	T1,2
+	  JRST	[TMSG	<[scp: client reported: >
+		 MOVE	T1,[POINT 7,SLIN,6]
+		 PSOUT%
+		 TMSG	<]
+>
+		 SETOM	SFAIL
+		 JRST	SNK2]
+	HRROI	T2,[ASCIZ /protocol error/]
+	MOVEI	T1,2
+	JRST	SCPERR
+
+;SNKFIL - "Cmmmm size name": receive one file
+
+SNKFIL:	MOVE	Q1,[POINT 7,SLIN,6] ;After the C
+SNKF1:	ILDB	T1,Q1		;Mode digits
+	CAIL	T1,"0"
+	 CAILE	T1,"7"
+	  SKIPA
+	JRST	SNKF1
+	CAIE	T1," "
+	 JRST	SNKPE
+	SETZ	Q2,		;Size
+SNKF2:	ILDB	T1,Q1
+	CAIL	T1,"0"
+	 CAILE	T1,"9"
+	  JRST	SNKF3
+	IMULI	Q2,^D10
+	ADDI	Q2,-"0"(T1)
+	JRST	SNKF2
+SNKF3:	CAIE	T1," "
+	 JRST	SNKPE
+	MOVEM	Q2,FSIZE
+	MOVE	T1,Q1		;Name: map to a TOPS-20 name in FNM
+	CALL	MAPNAM
+	 JRST	[HRROI	T2,[ASCIZ /file name not usable on TOPS-20/]
+		 MOVEI	T1,1
+		 JRST	SCPERR]
+	SKIPN	ISDIR		;Target: directory + name, or the path
+	 JRST	SNKF4
+	HRROI	T1,TNAM
+	HRROI	T2,TDIR
+	SETZ	T3,
+	SOUT%
+	HRROI	T2,FNM
+	SOUT%
+	IDPB	T3,T1
+SNKF4:	CALL	CAPON
+	MOVX	T1,GJ%FOU!GJ%SHT
+	HRROI	T2,TNAM
+	GTJFN%
+	 ERJMP	SNKFE
+	MOVEM	T1,FJFN
+	CALL	DIRNUM		;T2 := its directory number
+	 JRST	SNKFR
+	MOVEI	T1,.CKACF	;May the user create files there?
+	SETZ	T3,
+	CALL	CHKACC
+	 JRST	SNKFD
+	MOVE	T1,FJFN
+	MOVX	T2,FLD(8,OF%BSZ)!OF%WR
+	OPENF%
+	 ERJMP	SNKFR
+	CALL	CAPOFF
+	CALL	SCPOK		;Send the data
+	SETOM	ALL7
+	SETZM	WERR
+	MOVE	T1,FSIZE
+	MOVEM	T1,FLEFT
+	MOVE	T1,FJFN		;Written in blocks (8-bit bytes)
+	MOVEM	T1,WJFN
+	MOVE	T1,[POINT 8,WBUF]
+	CALL	WRINI
+SNKF5:	SOSGE	FLEFT
+	 JRST	SNKF6
+	CALL	SCPGB
+	 JRST	SNKFL		;Lost
+	CAILE	T1,177
+	 SETZM	ALL7
+	CALL	PUTW
+	JRST	SNKF5
+SNKF6:	CALL	WFLUSH		;The last block
+	CALL	SCPGB		;The client's 0 after the data
+	 JRST	SNKFL
+	MOVE	T1,FJFN
+	TXO	T1,CO%NRJ
+	CLOSF%
+	 ERJMP	[SETOM	WERR
+		 JRST	.+1]
+	SKIPN	WERR
+	 SKIPN	ALL7
+	  JRST	SNKF7
+	SKIPE	FSIZE
+	 CALL	TOTEXT		;All 7-bit: make it a text file
+SNKF7:	MOVE	T1,FJFN
+	RLJFN%
+	 ERJMP	.+1
+	SKIPE	WERR
+	 JRST	[HRROI	T2,[ASCIZ /write error/]
+		 MOVEI	T1,1
+		 JRST	SCPERR]
+	CALL	SCPOK
+	TMSG	<[scp: received >
+	HRROI	T1,TNAM
+	PSOUT%
+	TMSG	<, >
+	MOVE	T2,FSIZE
+	CALL	DECOUT
+	HRROI	T1,[ASCIZ / bytes, binary (8-bit)]
+/]
+	SKIPE	ALL7
+	 HRROI	T1,[ASCIZ / bytes, text]
+/]
+	PSOUT%
+	RET
+SNKFL:	SETOM	SLOST		;Connection lost during the data
+	MOVE	T1,FJFN
+	TXO	T1,CZ%ABT
+	CLOSF%
+	 ERJMP	.+1
+	RET
+SNKFD:	MOVE	T1,FJFN		;No access
+	RLJFN%
+	 ERJMP	.+1
+	CALL	CAPOFF
+	HRROI	T2,[ASCIZ /permission denied/]
+	MOVEI	T1,1
+	JRST	SCPERR
+SNKFR:	CALL	CAPOFF		;Error with the JFN
+	CALL	ERRTXT
+	MOVE	T1,FJFN
+	RLJFN%
+	 ERJMP	.+1
+	JRST	SNKFE1
+SNKFE:	CALL	CAPOFF		;GTJFN% failed
+	CALL	ERRTXT
+SNKFE1:	HRROI	T2,MBUF
+	MOVEI	T1,1
+	JRST	SCPERR
+SNKPE:	HRROI	T2,[ASCIZ /bad file line from the client/]
+	MOVEI	T1,2
+	JRST	SCPERR
+
+;TOTEXT - FJFN (closed, 8-bit) := a new 7-bit generation with LF ->
+;CRLF; the 8-bit generation is deleted.
+
+TOTEXT:	CALL	CAPON
+	MOVE	T1,FJFN
+	MOVX	T2,FLD(8,OF%BSZ)!OF%RD
+	OPENF%
+	 ERJMP	TOTXE
+	MOVX	T1,GJ%FOU!GJ%SHT
+	HRROI	T2,TNAM
+	GTJFN%
+	 ERJMP	TOTXC
+	MOVEM	T1,TJFN
+	MOVX	T2,FLD(7,OF%BSZ)!OF%WR
+	OPENF%
+	 ERJMP	TOTXR
+	CALL	CAPOFF
+	MOVE	T1,FJFN		;Read the 8-bit version in blocks
+	MOVEM	T1,RJFN
+	MOVE	T1,[POINT 8,RBUF]
+	MOVEM	T1,RPTR0
+	MOVE	T1,FSIZE
+	MOVEM	T1,FLEFT
+	SETZM	RCNT
+	MOVE	T1,TJFN		;Write the 7-bit one in blocks
+	MOVEM	T1,WJFN
+	MOVE	T1,[POINT 7,WBUF]
+	CALL	WRINI
+	SETZ	Q3,		;Previous byte
+TOTX1:	CALL	GETR		;T2 = next byte
+	 JRST	TOTX2
+	CAIN	T2,12		;LF not after a CR: add one
+	 CAIN	Q3,15
+	  JRST	TOTX1A
+	PUSH	P,T2
+	MOVEI	T1,15
+	CALL	PUTW
+	POP	P,T2
+TOTX1A:	MOVE	Q3,T2
+	MOVE	T1,T2
+	CALL	PUTW
+	JRST	TOTX1
+TOTX2:	CALL	WFLUSH
+	MOVE	T1,TJFN
+	CLOSF%
+	 ERJMP	.+1
+	MOVE	T1,FJFN
+	TXO	T1,CO%NRJ
+	CLOSF%
+	 ERJMP	.+1
+	CALL	CAPON
+	MOVE	T1,FJFN		;Delete and expunge the 8-bit version
+	TXO	T1,DF%EXP!DF%NRJ
+	DELF%
+	 ERJMP	.+1
+	CALL	CAPOFF
+	RET
+TOTXR:	MOVE	T1,TJFN
+	RLJFN%
+	 ERJMP	.+1
+TOTXC:	MOVE	T1,FJFN
+	TXO	T1,CO%NRJ
+	CLOSF%
+	 ERJMP	.+1
+TOTXE:	CALL	CAPOFF		;Couldn't: it stays binary
+	SETZM	ALL7
+	RET
+
+	SUBTTL	Download (scp -f)
+
+SCPSRC:	LDB	T1,[POINT 7,SCPPTH,6]
+	JUMPE	T1,[HRROI T2,[ASCIZ /no file name given/]
+		    MOVEI T1,1
+		    JRST SCPERR]
+	HRROI	T1,TNAM		;Relative to PS:<user>
+	HRROI	T2,SCPPTH
+	CALL	FULNAM
+	CALL	SCPGB		;Wait for the client's 0
+	 RET
+	CALL	CAPON
+	MOVX	T1,GJ%OLD!GJ%IFG!GJ%SHT
+	HRROI	T2,TNAM
+	GTJFN%
+	 ERJMP	[CALL	CAPOFF
+		 CALL	ERRTXT
+		 HRROI	T2,MBUF
+		 MOVEI	T1,1
+		 JRST	SCPERR]
+	MOVEM	T1,GJFN
+	CALL	CAPOFF
+SRC1:	HRRZ	T1,GJFN		;This file
+	MOVEM	T1,FJFN
+	CALL	SRCFIL
+	SKIPE	SLOST
+	 JRST	SRC9
+	CALL	CAPON		;Next file (wildcards; looking through the
+	MOVE	T1,GJFN		; directory needs WHEEL, as the GTJFN% did)
+	GNJFN%
+	 ERJMP	SRC2
+	CALL	CAPOFF
+	JRST	SRC1
+SRC2:	CALL	CAPOFF		;No more files (the JFN is released), or
+	MOVEI	T1,.FHSLF	; an error to report
+	GETER%
+	HRRZ	T2,T2
+	CAIN	T2,GNJFX1
+	 RET
+	CALL	ERRTXT
+	HRROI	T2,MBUF
+	MOVEI	T1,1
+	JRST	SCPERR
+SRC9:	HRRZ	T1,GJFN
+	RLJFN%
+	 ERJMP	.+1
+	RET
+
+;SRCFIL - send the file FJFN
+
+SRCFIL:	HRROI	T1,FNM		;NAME.TYPE for the C line and messages
+	MOVE	T2,FJFN
+	MOVX	T3,FLD(.JSAOF,JS%NAM)!FLD(.JSAOF,JS%TYP)!JS%PAF
+	JFNS%
+	 ERJMP	.+1
+	MOVEI	T1,.CKARD	;May the user read it?
+	MOVE	T2,FJFN
+	MOVX	T3,CK%JFN
+	CALL	CHKACC
+	 JRST	[MOVEI	T2,[ASCIZ /permission denied/]
+		 JRST	SRCFE]
+	MOVE	T1,FJFN		;Byte size and length
+	MOVE	T2,[1,,.FBBYV]
+	MOVEI	T3,FBSZ
+	GTFDB%
+	 ERJMP	SRCFR
+	LDB	T1,[POINT 6,FBSZ,11]
+	MOVEM	T1,FBSZ
+	MOVE	T1,FJFN
+	MOVE	T2,[1,,.FBSIZ]
+	MOVEI	T3,FSIZE
+	GTFDB%
+	 ERJMP	SRCFR
+	MOVE	T1,FBSZ
+	SKIPN	FSIZE		;(An empty file: as text)
+	 MOVEI	T1,7
+	MOVEM	T1,FBSZ
+	CAIE	T1,7
+	 CAIN	T1,^D8
+	  SKIPA
+	JRST	[MOVEI	T2,[ASCIZ /not a 7- or 8-bit file (36-bit files can't be copied with scp)/]
+		 JRST	SRCFE]
+	CALL	CAPON
+	MOVE	T1,FJFN
+	MOVE	T2,FBSZ
+	LSH	T2,^D30		;OF%BSZ field
+	TXO	T2,OF%RD
+	OPENF%
+	 ERJMP	[CALL	CAPOFF
+		 JRST	SRCFR]
+	CALL	CAPOFF
+	MOVE	T1,FSIZE	;Bytes to send
+	MOVEM	T1,FCNT
+	MOVE	T1,FBSZ
+	CAIE	T1,7
+	 JRST	SRCF2
+	SETZ	Q3,		;Text: count CR LF pairs (sent as LF)
+	CALL	RDINI
+SRCF1:	CALL	GETR		;T2 = next byte
+	 JRST	SRCF1A
+	CAIN	T2,12
+	 CAIE	Q3,15
+	  SKIPA
+	SOS	FCNT
+	MOVE	Q3,T2
+	JRST	SRCF1
+SRCF1A:	MOVE	T1,FJFN		;Back to the start
+	SETZ	T2,
+	SFPTR%
+	 ERJMP	.+1
+SRCF2:	MOVEI	T1,"C"		;"C0644 size name"
+	CALL	SCPPB
+	HRROI	T2,[ASCIZ /0644 /]
+	CALL	SCPPS
+	HRROI	T1,NBUF
+	MOVE	T2,FCNT
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	SETZ	T3,		;(NOUT% leaves no NUL)
+	IDPB	T3,T1
+	HRROI	T2,NBUF
+	CALL	SCPPS
+	MOVEI	T1," "
+	CALL	SCPPB
+	HRROI	T2,FNM
+	CALL	SCPPS
+	MOVEI	T1,12
+	CALL	SCPPB
+	CALL	SCPFL
+	CALL	SCPGB		;The client's answer
+	 JRST	SRCFL
+	JUMPE	T1,SRCF3
+	CALL	SCPGL		;It refused (message follows)
+	 JFCL
+	TMSG	<[scp: client refused >
+	HRROI	T1,FNM
+	PSOUT%
+	TMSG	<: >
+	HRROI	T1,SLIN
+	PSOUT%
+	TMSG	<]
+>
+	SETOM	SFAIL
+	JRST	SRCFC
+SRCF3:	CALL	RDINI		;The data (read in blocks)
+	SETZM	PCR
+SRCF4:	CALL	GETR		;T2 = next byte
+	 JRST	SRCF6
+	MOVE	T1,FBSZ
+	CAIE	T1,7
+	 JRST	SRCF5		;Binary: as it is
+	CAIN	T2,15		;Text: CR LF -> LF
+	 JRST	[SKIPE	PCR	;A CR after a CR: send the first
+		  CALL	SRCCR
+		 SETOM	PCR
+		 JRST	SRCF4]
+	CAIE	T2,12
+	 SKIPN	PCR		;Something else after a CR: send the CR
+	  SKIPA
+	CALL	SRCCR
+	SETZM	PCR
+SRCF5:	MOVE	T1,T2
+	CALL	SCPPB
+	JRST	SRCF4
+SRCF6:	SKIPE	PCR		;A CR at the very end
+	 CALL	SRCCR
+	SETZ	T1,		;End of data
+	CALL	SCPPB
+	CALL	SCPFL
+	CALL	SCPGB		;The client's 0
+	 JRST	SRCFL
+	TMSG	<[scp: sent >
+	HRROI	T1,FNM
+	PSOUT%
+	TMSG	<, >
+	MOVE	T2,FCNT
+	CALL	DECOUT
+	HRROI	T1,[ASCIZ / bytes, binary]
+/]
+	MOVE	T2,FBSZ
+	CAIN	T2,7
+	 HRROI	T1,[ASCIZ / bytes, text]
+/]
+	PSOUT%
+SRCFC:	MOVE	T1,FJFN		;Close, keep the JFN (GNJFN%)
+	TXO	T1,CO%NRJ
+	CLOSF%
+	 ERJMP	.+1
+	RET
+SRCFL:	SETOM	SLOST
+	JRST	SRCFC
+SRCCR:	PUSH	P,T2
+	MOVEI	T1,15
+	CALL	SCPPB
+	POP	P,T2
+	RET
+SRCFR:	CALL	ERRTXT		;System error: text in MBUF
+	MOVEI	T2,MBUF
+SRCFE:	PUSH	P,T2		;"NAME.TYPE: message" as a warning
+	HRROI	T1,MBUF+30	;(build after MBUF's first half)
+	HRROI	T2,FNM
+	SETZ	T3,
+	SOUT%
+	HRROI	T2,[ASCIZ /: /]
+	SOUT%
+	POP	P,T2
+	HRLI	T2,(POINT 7,)
+	SOUT%
+	IDPB	T3,T1
+	HRROI	T2,MBUF+30
+	MOVEI	T1,1
+	JRST	SCPERR
+
+	SUBTTL	Helpers
+
+;Block I/O for files (a monitor call per byte would be slow).
+;
+;RDINI - read FJFN from where it is, byte size FBSZ, FSIZE bytes
+;GETR  - T2 := next byte; non-skip at the end.  Uses RJFN, RPTR0,
+;        FLEFT (bytes not yet read), RCNT/RPTR (bytes in RBUF)
+;WRINI - T1/ initial byte pointer into WBUF; writes go to WJFN
+;PUTW  - write byte T1 (collected; WFLUSH writes the block, WERR on error)
+
+RDINI:	MOVE	T1,FJFN
+	MOVEM	T1,RJFN
+	MOVE	T1,[POINT 7,RBUF]
+	MOVE	T2,FBSZ
+	CAIE	T2,7
+	 MOVE	T1,[POINT 8,RBUF]
+	MOVEM	T1,RPTR0
+	MOVE	T1,FSIZE
+	MOVEM	T1,FLEFT
+	SETZM	RCNT
+	RET
+
+GETR:	SOSGE	RCNT
+	 JRST	GETR1
+	ILDB	T2,RPTR
+	RETSKP
+GETR1:	SETZM	RCNT		;Block used up: read the next one
+	SKIPG	FLEFT
+	 RET
+	MOVE	T3,FLEFT
+	CAILE	T3,RBMAX
+	 MOVEI	T3,RBMAX
+	MOVEM	T3,RREQ
+	MOVE	T1,RJFN
+	MOVE	T2,RPTR0
+	MOVN	T3,T3
+	SIN%
+	 ERJMP	.+1		;(End of file: fewer bytes)
+	ADD	T3,RREQ		;Bytes read
+	MOVEM	T3,RCNT
+	MOVN	T1,T3
+	ADDM	T1,FLEFT
+	SKIPG	T3		;Nothing: stop
+	 JRST	[SETZM	FLEFT
+		 RET]
+	MOVE	T1,RPTR0
+	MOVEM	T1,RPTR
+	JRST	GETR
+
+WRINI:	MOVEM	T1,WPTR0
+	MOVEM	T1,WPTR
+	SETZM	WCNT
+	RET
+
+PUTW:	IDPB	T1,WPTR
+	AOS	T1,WCNT
+	CAIL	T1,WBMAX
+	 CALL	WFLUSH
+	RET
+
+WFLUSH:	SKIPN	WCNT
+	 RET
+	MOVE	T1,WJFN
+	MOVE	T2,WPTR0
+	MOVN	T3,WCNT
+	SOUT%
+	 ERJMP	[SETOM	WERR
+		 JRST	.+1]
+	MOVE	T1,WPTR0
+	MOVEM	T1,WPTR
+	SETZM	WCNT
+	RET
+
+;FULNAM - T1/ dest := T2 string, with "PS:<user>" in front if it has
+;no device or directory of its own
+
+FULNAM:	PUSH	P,T1
+	PUSH	P,T2
+	MOVE	T3,T2		;Any : or < in it?
+	HRLI	T3,(POINT 7,)
+FULN1:	ILDB	T4,T3
+	JUMPE	T4,FULN2
+	CAIE	T4,":"
+	 CAIN	T4,"<"
+	  JRST	FULN3
+	JRST	FULN1
+FULN2:	MOVE	T1,-1(P)	;No: PS:<user> first
+	HRROI	T2,DNAM
+	SETZ	T3,
+	SOUT%
+	MOVEM	T1,-1(P)
+FULN3:	POP	P,T2
+	POP	P,T1
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	RET
+
+;MAPNAM - T1/ byte pointer to a Unix file name: FNM := upper case,
+;characters other than letters, digits, - _ $ made -, only the first .
+;kept.  Skip return if usable (1-39 . 0-39 characters).
+
+MAPNAM:	MOVE	T2,[POINT 7,FNM]
+	SETZB	T3,T4		;T3 = length of this part, T4 = dot seen
+MAPN1:	ILDB	Q3,T1
+	JUMPE	Q3,MAPN4
+	CAIN	Q3,"/"		;A path: keep only the last part
+	 JRST	[MOVE	T2,[POINT 7,FNM]
+		 SETZB	T3,T4
+		 JRST	MAPN1]
+	CAIL	Q3,"a"
+	 CAILE	Q3,"z"
+	  SKIPA
+	SUBI	Q3,40
+	CAIN	Q3,"."
+	 JRST	[JUMPN	T4,MAPN2 ;Second dot: -
+		 JUMPE	T3,R	;Nothing before it
+		 SETO	T4,
+		 SETZ	T3,
+		 IDPB	Q3,T2
+		 JRST	MAPN1]
+	CAIL	Q3,"A"
+	 CAILE	Q3,"Z"
+	  SKIPA
+	JRST	MAPN3
+	CAIL	Q3,"0"
+	 CAILE	Q3,"9"
+	  SKIPA
+	JRST	MAPN3
+	CAIE	Q3,"-"
+	 CAIN	Q3,"_"
+	  JRST	MAPN3
+	CAIN	Q3,"$"
+	 JRST	MAPN3
+MAPN2:	MOVEI	Q3,"-"
+MAPN3:	CAIL	T3,^D39
+	 RET
+	IDPB	Q3,T2
+	AOJA	T3,MAPN1
+MAPN4:	IDPB	Q3,T2
+	LDB	T1,[POINT 7,FNM,6]
+	JUMPE	T1,R
+	RETSKP
+
+;DIRNUM - T2 := directory number of the file FJFN.  Skip if OK.
+
+DIRNUM:	HRROI	T1,MBUF
+	MOVE	T2,FJFN
+	MOVX	T3,FLD(.JSAOF,JS%DEV)!FLD(.JSAOF,JS%DIR)!JS%PAF
+	JFNS%
+	 ERJMP	R
+	MOVX	T1,RC%EMO
+	HRROI	T2,MBUF
+	RCDIR%
+	 ERJMP	R
+	TXNE	T1,RC%NOM!RC%AMB
+	 RET
+	MOVE	T2,T3
+	RETSKP
+
+;CHKACC - T1/ access code, T2/ JFN or directory number, T3/ 0 or
+;CK%JFN.  Skip return if the logged-in user (no capabilities) may.
+
+CHKACC:	MOVEM	T1,CKBLK+.CKAAC
+	MOVE	T1,UNUM
+	MOVEM	T1,CKBLK+.CKALD
+	MOVE	T1,UDIR
+	MOVEM	T1,CKBLK+.CKACD
+	SETZM	CKBLK+.CKAEC
+	HRRZM	T2,CKBLK+.CKAUD
+	TXNN	T3,CK%JFN
+	 MOVEM	T2,CKBLK+.CKAUD	;(A directory number: all of it)
+	SETZM	CKBLK+.CKAPR
+	MOVEI	T1,6
+	IOR	T1,T3
+	MOVEI	T2,CKBLK
+	CHKAC%
+	 ERJMP	R
+	JUMPE	T1,R
+	RETSKP
+
+;ERRTXT - MBUF := text of the last error
+
+ERRTXT:	HRROI	T1,MBUF
+	HRLOI	T2,.FHSLF
+	SETZ	T3,
+	ERSTR%
+	 JFCL
+	 JFCL
+	RET
+
+	SUBTTL	Channel input and output
+
+;SCPDAT - T2/T3 = data received on the channel (from DDATA): keep it
+
+SCPDAT:	MOVE	T1,IBW
+	ADD	T1,T3
+	CAILE	T1,IBMAX
+	 CALL	IBCOMP
+	MOVE	T1,IBW
+	ADD	T1,T3
+	CAILE	T1,IBMAX
+	 RET			;No room (can't happen with our window)
+SCPDA1:	SOJL	T3,R
+	MOVE	T1,(T2)
+	MOVE	T4,IBW
+	MOVEM	T1,IBUF(T4)
+	AOS	IBW
+	AOJA	T2,SCPDA1
+
+IBCOMP:	PUSH	P,T2		;Move the unread bytes to the start
+	PUSH	P,T3
+	MOVE	T1,IBR
+	JUMPE	T1,IBCOM1
+	MOVE	T3,IBW
+	SUB	T3,T1		;Unread bytes
+	MOVEM	T3,IBW
+	SETZM	IBR
+	JUMPE	T3,IBCOM1
+	MOVEI	T2,IBUF
+	ADD	T2,T1
+	HRLZ	T1,T2
+	HRRI	T1,IBUF
+	BLT	T1,IBUF-1(T3)
+IBCOM1:	POP	P,T3
+	POP	P,T2
+	RET
+
+;SCPGB - T1 := next byte from the client.  Non-skip at the end.
+
+SCPGB:	MOVE	T1,IBR
+	CAML	T1,IBW
+	 JRST	SCPGB1
+	MOVE	T1,IBUF(T1)
+	AOS	IBR
+	RETSKP
+SCPGB1:	SETZM	IBR		;Empty: get more
+	SETZM	IBW
+	SKIPN	SLOST
+	 SKIPE	CEOF
+	  RET
+	CALL	SCPPMP
+	 JRST	[SETOM	SLOST
+		 RET]
+	JRST	SCPGB
+
+;SCPPMP - receive and handle one packet (data lands in IBUF via DDATA).
+;Gives up after 60 seconds without a packet (a stalled connection would
+;otherwise hang the session forever).
+
+SCPPMP:	TIME%			;Deadline for GETN (LGDEAD)
+	ADDI	T1,^D60000
+	MOVEM	T1,LGDEAD
+	CALL	RCVPKT
+	 JRST	[SETZM	LGDEAD
+		 RET]
+	SETZM	LGDEAD
+	CALL	DISPAT
+	 RET			;Channel closed, or disconnect
+	RETSKP
+
+;SCPGL - SLIN := next line from the client.  Non-skip at the end.
+
+SCPGL:	MOVE	T3,[POINT 7,SLIN]
+	MOVEI	T4,^D990
+SCPGL1:	PUSH	P,T3
+	PUSH	P,T4
+	CALL	SCPGB
+	 JRST	[POP	P,T4
+		 POP	P,T3
+		 RET]
+	POP	P,T4
+	POP	P,T3
+	CAIN	T1,12
+	 JRST	SCPGL2
+	SOJL	T4,SCPGL1	;Too long: the rest is dropped
+	IDPB	T1,T3
+	JRST	SCPGL1
+SCPGL2:	SETZ	T1,
+	IDPB	T1,T3
+	RETSKP
+
+;SCPPB - send byte T1 (collected; SCPFL sends)
+
+SCPPB:	MOVE	T2,OCNT
+	MOVEM	T1,OBYT(T2)
+	AOS	T2,OCNT
+	CAIL	T2,OBMAX
+	 CALL	SCPFL
+	RET
+
+;SCPPS - send the ASCIZ at T2
+
+SCPPS:	HRLI	T2,(POINT 7,)
+SCPPS1:	ILDB	T1,T2
+	JUMPE	T1,R
+	PUSH	P,T2
+	CALL	SCPPB
+	POP	P,T2
+	JRST	SCPPS1
+
+;SCPFL - send what was collected as CHANNEL_DATA, within the client's
+;window (waits for WINDOW_ADJUST).  (SNDPKT/RCVPKT use Q1-Q3: the
+;loops here and in the callers count in memory.)
+
+SCPFL:	SETZM	SFOFF		;Bytes sent
+SCPFL1:	MOVE	T1,SFOFF
+	CAML	T1,OCNT
+	 JRST	SCPFL9
+	SKIPE	SLOST
+	 JRST	SCPFL9
+SCPFL2:	SKIPLE	RWIN		;Room in the window?
+	 JRST	SCPFL3
+	CALL	SCPPMP
+	 JRST	[SETOM	SLOST
+		 JRST	SCPFL9]
+	JRST	SCPFL2
+SCPFL3:	MOVE	T3,OCNT
+	SUB	T3,SFOFF
+	CAMLE	T3,RWIN
+	 MOVE	T3,RWIN
+	CAMLE	T3,RMAXP
+	 MOVE	T3,RMAXP
+	PUSH	P,T3
+	SETZM	OLEN
+	MOVEI	T1,SSHCDA
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	MOVEI	T2,OBYT
+	ADD	T2,SFOFF
+	MOVE	T3,(P)
+	CALL	OSTR
+	CALL	SNDPKT
+	 JFCL
+	POP	P,T3
+	ADDM	T3,SFOFF
+	MOVN	T1,T3
+	ADDM	T1,RWIN
+	JRST	SCPFL1
+SCPFL9:	SETZM	OCNT
+	RET
+
+;SCPOK - send 0 (ready / done)
+
+SCPOK:	SETZ	T1,
+	CALL	SCPPB
+	JRST	SCPFL
+
+;SCPERR - T1/ 1 (warning: the client goes on) or 2 (fatal), T2/ message:
+;send it ("scp: message"), log it, mark the transfer failed.  Returns
+;to our caller's caller.
+
+SCPERR:	PUSH	P,T2
+	CALL	SCPPB		;1 or 2
+	HRROI	T2,[ASCIZ /scp: /]
+	CALL	SCPPS
+	MOVE	T2,(P)
+	CALL	SCPPS
+	MOVEI	T1,12
+	CALL	SCPPB
+	CALL	SCPFL
+	TMSG	<?scp: >
+	POP	P,T1
+	HRLI	T1,(POINT 7,)
+	PSOUT%
+	TMSG	<
+>
+	SETOM	SFAIL
+	RET
+
+	LIT
+
+	END

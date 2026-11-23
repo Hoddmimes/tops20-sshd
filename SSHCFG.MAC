@@ -1,0 +1,479 @@
+	TITLE	SSHCFG - TOPS-20 SSH server: configuration file (SSHD.CFG)
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	ERRMSG,R,RSKP,UNAM
+	INTERN	AKNAM,CFGRD,CFPORT,MKTCPN,TCPNAM,PWAUTH,USRDIS,CFGQ,CFMAXS,CFLGTO
+
+	SUBTTL	Configuration file (SSHD.CFG)
+
+;PS:<user>SSHD.CFG (user = the server's login user, normally SSHD),
+;read at startup and again at the start of every connection, so
+;changes apply to the next login (a new PORT from the next listen).  One setting per line, keyword then value;
+;blank lines and lines starting with ; ! or # are ignored:
+;
+;	PORT 22				TCP port to listen on
+;	AUTHORIZED-KEYS SSH-AUTHORIZED-KEYS.TXT
+;					file in each user's login
+;					directory with SSH public keys
+;	PASSWORD-AUTHENTICATION NO	only key logins (default YES)
+;	DISABLE-USER name		user may not log in over SSH
+;					(one per line, up to 50)
+;	MAX-SESSIONS 8			concurrent sessions (1-16)
+;	LOGIN-TIMEOUT 120		seconds to log in (0 = no limit)
+;
+;Missing file or bad lines: defaults (port 22, SSH-AUTHORIZED-KEYS.TXT,
+;passwords allowed, no disabled users) and a %SSHD.CFG warning in the
+;log.  The key file must be a plain
+;file name (letters, digits, - . _ $), so it is always looked up as
+;PS:<user>name for the user logging in.
+
+CFGMAX==^D6000			;Largest configuration file (characters)
+NDISMX==^D50			;Most DISABLE-USER lines
+
+CFPORT:	BLOCK	1		;Port to listen on
+AKNAM:	BLOCK	10		;Authorized keys file name, ASCIZ
+AKTMP:	BLOCK	10		;Value being parsed (ASCIZ, upper case)
+PWAUTH:	BLOCK	1		;Nonzero: password logins allowed
+CFMAXS:	BLOCK	1		;Most concurrent sessions
+CFLGTO:	BLOCK	1		;Login timeout, seconds (0 = none)
+CFGQ:	BLOCK	1		;Nonzero: no summary line (re-reads)
+NDIS:	BLOCK	1		;Number of disabled users
+DISTAB:	BLOCK	NDISMX*10	;Their names, 8 words (ASCIZ) each
+CFGNAM:	BLOCK	^D20		;"PS:<user>SSHD.CFG"
+TCPNAM:	BLOCK	4		;"TCP:nnnnn#."
+CFLINE:	BLOCK	^D20		;Current line, ASCIZ (79 characters max)
+CFKW:	BLOCK	10		;Its keyword, upper case
+CFGVP:	BLOCK	1		;Byte pointer to the value (ILDB)
+CFNUL:	0			;Empty string
+CFGBUF:	BLOCK	CFGMAX/5+1	;The file
+
+;CFGRD - set the defaults, then read SSHD.CFG if there is one.
+
+CFGRD:	PUSH	P,Q1
+	PUSH	P,Q2
+	PUSH	P,Q3
+	MOVEI	T1,^D22		;Defaults
+	MOVEM	T1,CFPORT
+	SETOM	PWAUTH
+	SETZM	NDIS
+	MOVEI	T1,^D8
+	MOVEM	T1,CFMAXS
+	MOVEI	T1,^D120
+	MOVEM	T1,CFLGTO
+	HRROI	T1,AKNAM
+	HRROI	T2,[ASCIZ /SSH-AUTHORIZED-KEYS.TXT/]
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	HRROI	T1,CFGNAM	;"PS:<user>SSHD.CFG"
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	PUSH	P,T1
+	GJINF%			;T1 = login user number (clobbers T1-T4)
+	MOVE	T2,T1
+	POP	P,T1
+	DIRST%
+	 ERJMP	CFGSUM
+	HRROI	T2,[ASCIZ />SSHD.CFG/]
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	MOVX	T1,GJ%OLD!GJ%SHT
+	HRROI	T2,CFGNAM
+	GTJFN%
+	 ERJMP	CFGNF
+	MOVE	Q3,T1		;Q3 = JFN
+	MOVX	T2,FLD(7,OF%BSZ)!OF%RD
+	OPENF%
+	 ERJMP	[TMSG <%SSHD.CFG: can't open: >
+		 CALL ERRMSG
+		 MOVE T1,Q3
+		 RLJFN%
+		  ERJMP .+1
+		 JRST CFGSUM]
+	MOVE	T1,Q3		;Read it all
+	MOVE	T2,[POINT 7,CFGBUF]
+	MOVNI	T3,CFGMAX
+	SETZ	T4,
+	SIN%
+	 ERJMP	.+1		;End of file
+	MOVEI	Q1,CFGMAX	;Q1 = characters read
+	ADD	Q1,T3
+	MOVE	T1,Q3
+	CLOSF%
+	 ERJMP	.+1
+	MOVE	Q2,[POINT 7,CFGBUF] ;Q2 = where we are in the file
+
+CFGLIN:	JUMPLE	Q1,CFGSUM	;Next line into CFLINE
+	MOVE	Q3,[POINT 7,CFLINE]
+	SETZ	T4,		;T4 = its length
+CFGL1:	JUMPLE	Q1,CFGL3
+	ILDB	T2,Q2
+	SUBI	Q1,1
+	CAIN	T2,12		;LF ends the line
+	 JRST	CFGL3
+	CAIE	T2,15		;CR and NUL are dropped
+	 CAIN	T2,0
+	  JRST	CFGL1
+	CAIN	T2,11		;TAB counts as a space
+	 MOVEI	T2," "
+	CAIL	T4,^D79		;Overlong: the rest is dropped
+	 JRST	CFGL1
+	IDPB	T2,Q3
+	AOJA	T4,CFGL1
+CFGL3:	SETZ	T2,
+	IDPB	T2,Q3
+	CALL	CFGDO
+	JRST	CFGLIN
+
+CFGNF:	SKIPE	CFGQ
+	 JRST	CFGSU2
+	TMSG	<[No SSHD.CFG: using the defaults]
+>
+CFGSUM:	SKIPE	CFGQ		;Re-read: quiet unless something is wrong
+	 JRST	CFGSU2
+	TMSG	<[Configuration: port >
+	MOVEI	T1,.PRIOU
+	MOVE	T2,CFPORT
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	TMSG	<, authorized keys file >
+	HRROI	T1,AKNAM
+	PSOUT%
+	HRROI	T1,[ASCIZ /, password logins allowed]
+/]
+	SKIPN	PWAUTH
+	 HRROI	T1,[ASCIZ /, password logins NOT allowed (keys only)]
+/]
+	PSOUT%
+	SKIPN	NDIS
+	 JRST	CFGSU2
+	TMSG	<[Disabled users:>
+	SETZ	Q1,
+CFGSU1:	TMSG	< >
+	MOVE	T1,Q1
+	IMULI	T1,10
+	ADD	T1,[POINT 7,DISTAB]
+	PSOUT%
+	ADDI	Q1,1
+	CAMGE	Q1,NDIS
+	 JRST	CFGSU1
+	TMSG	<]
+>
+CFGSU2:
+	POP	P,Q3
+	POP	P,Q2
+	POP	P,Q1
+	RET
+
+;CFGDO - handle the line in CFLINE
+
+CFGDO:	MOVE	T1,[POINT 7,CFLINE]
+	CALL	CFSKSP		;T2 = first non-space character
+	JUMPE	T2,R		;Blank line
+	CAIE	T2,";"		;Comment?
+	 CAIN	T2,"!"
+	  RET
+	CAIN	T2,"#"
+	 RET
+	MOVE	T3,[POINT 7,CFKW] ;Keyword, upper case
+	MOVEI	T4,^D39		;Room in CFKW
+CFGK1:	ILDB	T2,T1
+	JUMPE	T2,CFGK2
+	CAIN	T2," "
+	 JRST	CFGK3
+	CAIL	T2,"a"
+	 CAILE	T2,"z"
+	  SKIPA
+	   SUBI	T2,40
+	SOJL	T4,CFGK1	;Too long: won't match anything
+	IDPB	T2,T3
+	JRST	CFGK1
+CFGK2:	MOVE	T1,[POINT 7,CFNUL] ;End of line: empty value
+CFGK3:	SETZ	T2,
+	IDPB	T2,T3
+	CALL	CFSKSP
+	MOVEM	T1,CFGVP
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /PORT/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFPRT
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /AUTHORIZED-KEYS/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFAK
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /PASSWORD-AUTHENTICATION/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFPWA
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /DISABLE-USER/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFDIS
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /MAX-SESSIONS/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFMXS
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /LOGIN-TIMEOUT/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFLTO
+	HRROI	T1,[ASCIZ /unknown keyword/]
+	JRST	CFWARN
+
+;LOGIN-TIMEOUT n: 0 (no limit) to 3600 seconds
+
+CFLTO:	MOVE	T1,CFGVP
+	SETZB	T3,T4
+CFLT1:	ILDB	T2,T1
+	CAIL	T2,"0"
+	 CAILE	T2,"9"
+	  JRST	CFLT2
+	IMULI	T4,^D10
+	ADDI	T4,-"0"(T2)
+	CAILE	T4,^D3600
+	 JRST	CFBADL
+	AOJA	T3,CFLT1
+CFLT2:	JUMPE	T3,CFBADL
+	CALL	CFTRL
+	 JRST	CFBADL
+	MOVEM	T4,CFLGTO
+	RET
+CFBADL:	HRROI	T1,[ASCIZ /bad LOGIN-TIMEOUT value (0-3600 seconds), ignored/]
+	JRST	CFWARN
+
+;MAX-SESSIONS n: 1 to SMAX
+
+CFMXS:	MOVE	T1,CFGVP
+	SETZB	T3,T4
+CFMX1:	ILDB	T2,T1
+	CAIL	T2,"0"
+	 CAILE	T2,"9"
+	  JRST	CFMX2
+	IMULI	T4,^D10
+	ADDI	T4,-"0"(T2)
+	CAILE	T4,SMAX
+	 JRST	CFBADM
+	AOJA	T3,CFMX1
+CFMX2:	JUMPE	T3,CFBADM
+	JUMPE	T4,CFBADM
+	CALL	CFTRL
+	 JRST	CFBADM
+	MOVEM	T4,CFMAXS
+	RET
+CFBADM:	HRROI	T1,[ASCIZ /bad MAX-SESSIONS value (1-16), ignored/]
+	JRST	CFWARN
+
+;PORT n: 1 to 65535
+
+CFPRT:	MOVE	T1,CFGVP
+	SETZB	T3,T4		;T3 = digits, T4 = value
+CFP1:	ILDB	T2,T1
+	CAIL	T2,"0"
+	 CAILE	T2,"9"
+	  JRST	CFP2
+	IMULI	T4,^D10
+	ADDI	T4,-"0"(T2)
+	CAILE	T4,^D65535
+	 JRST	CFBADP
+	AOJA	T3,CFP1
+CFP2:	JUMPE	T3,CFBADP
+	JUMPE	T4,CFBADP
+	CALL	CFTRL		;Only spaces may follow
+	 JRST	CFBADP
+	MOVEM	T4,CFPORT
+	RET
+CFBADP:	HRROI	T1,[ASCIZ /bad PORT value (1-65535), ignored/]
+	JRST	CFWARN
+
+;CFVAL - the value as one word into AKTMP (upper case, letters, digits,
+;- . _ $, at most 39 characters, only spaces after it).  Skip if OK.
+
+CFVAL:	MOVE	T1,CFGVP
+	MOVE	T3,[POINT 7,AKTMP]
+	SETZ	T4,		;T4 = length
+CFV1:	ILDB	T2,T1
+	JUMPE	T2,CFV3
+	CAIN	T2," "
+	 JRST	CFV2
+	CAIL	T2,"a"
+	 CAILE	T2,"z"
+	  SKIPA
+	   SUBI	T2,40
+	CALL	CFOKCH
+	 RET
+	CAIL	T4,^D39
+	 RET
+	IDPB	T2,T3
+	AOJA	T4,CFV1
+CFV2:	CALL	CFTRL		;Only spaces may follow
+	 RET
+CFV3:	JUMPE	T4,R
+	SETZ	T2,
+	IDPB	T2,T3
+	RETSKP
+
+;AUTHORIZED-KEYS name: a plain file name, at most 39 characters
+
+CFAK:	CALL	CFVAL
+	 JRST	CFBADA
+	MOVE	T1,[AKTMP,,AKNAM]
+	BLT	T1,AKNAM+7
+	RET
+CFBADA:	HRROI	T1,[ASCIZ /bad AUTHORIZED-KEYS file name (plain name only), ignored/]
+	JRST	CFWARN
+
+;PASSWORD-AUTHENTICATION YES or NO
+
+CFPWA:	CALL	CFVAL
+	 JRST	CFBADW
+	MOVE	T1,[POINT 7,AKTMP]
+	MOVE	T2,[POINT 7,[ASCIZ /YES/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	[SETOM	PWAUTH
+		 RET]
+	MOVE	T1,[POINT 7,AKTMP]
+	MOVE	T2,[POINT 7,[ASCIZ /NO/]]
+	CALL	CFGCMP
+	 JRST	CFBADW
+	SETZM	PWAUTH
+	RET
+CFBADW:	HRROI	T1,[ASCIZ /PASSWORD-AUTHENTICATION must be YES or NO, ignored/]
+	JRST	CFWARN
+
+;DISABLE-USER name
+
+CFDIS:	CALL	CFVAL
+	 JRST	CFBADU
+	MOVE	T1,NDIS
+	CAIL	T1,NDISMX
+	 JRST	[HRROI	T1,[ASCIZ /too many DISABLE-USER lines (50), ignored/]
+		 JRST	CFWARN]
+	IMULI	T1,10
+	ADDI	T1,DISTAB
+	HRLI	T1,AKTMP
+	MOVEI	T2,7(T1)
+	BLT	T1,(T2)
+	AOS	NDIS
+	RET
+CFBADU:	HRROI	T1,[ASCIZ /bad DISABLE-USER name, ignored/]
+	JRST	CFWARN
+
+;USRDIS - skip return if UNAM is listed with DISABLE-USER
+
+USRDIS:	PUSH	P,Q1
+	SETZ	Q1,
+USRDS1:	CAML	Q1,NDIS
+	 JRST	USRDS2
+	MOVE	T1,[POINT 7,UNAM]
+	MOVE	T2,Q1
+	IMULI	T2,10
+	ADD	T2,[POINT 7,DISTAB]
+	CALL	CFGCMP
+	 AOJA	Q1,USRDS1
+	AOS	-1(P)		;Listed: skip return
+USRDS2:	POP	P,Q1
+	RET
+
+;CFOKCH - skip if T2 may be in a file name
+
+CFOKCH:	CAIL	T2,"A"
+	 CAILE	T2,"Z"
+	  SKIPA
+	   RETSKP
+	CAIL	T2,"0"
+	 CAILE	T2,"9"
+	  SKIPA
+	   RETSKP
+	CAIE	T2,"-"
+	 CAIN	T2,"."
+	  RETSKP
+	CAIE	T2,"_"
+	 CAIN	T2,"$"
+	  RETSKP
+	RET
+
+;CFSKSP - skip spaces at T1 (ILDB pointer): T2 = next character,
+;T1 left pointing just before it.
+
+CFSKSP:	MOVE	T3,T1
+	ILDB	T2,T1
+	CAIN	T2," "
+	 JRST	CFSKSP
+	MOVE	T1,T3
+	RET
+
+;CFTRL - T2 = current character, T1 = ILDB pointer: skip if only
+;spaces are left on the line.
+
+CFTRL:	JUMPE	T2,RSKP
+	CAIE	T2," "
+	 RET
+	ILDB	T2,T1
+	JRST	CFTRL
+
+;CFGCMP - skip if the ASCIZ strings at byte pointers T1 and T2 are equal
+
+CFGCMP:	ILDB	T3,T1
+	ILDB	T4,T2
+	CAME	T3,T4
+	 RET
+	JUMPN	T3,CFGCMP
+	RETSKP
+
+;CFWARN - "%SSHD.CFG: " message (T1) ": " line
+
+CFWARN:	PUSH	P,T1
+	TMSG	<%SSHD.CFG: >
+	POP	P,T1
+	PSOUT%
+	TMSG	<: >
+	HRROI	T1,CFLINE
+	PSOUT%
+	TMSG	<
+>
+	RET
+
+
+;MKTCPN - TCPNAM := "TCP:port." for CFPORT, with ^V# after a port
+;below 256 or from 32768 up (TOPS-20 wants it for those).
+
+MKTCPN:	HRROI	T1,TCPNAM
+	HRROI	T2,[ASCIZ /TCP:/]
+	SETZ	T3,
+	SOUT%
+	MOVE	T2,CFPORT
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	MOVE	T2,CFPORT
+	CAIL	T2,^D256
+	 CAIL	T2,^D32768
+	  CALL	MKTCPQ
+	MOVEI	T3,"."
+	IDPB	T3,T1
+	SETZ	T3,
+	IDPB	T3,T1
+	RET
+
+MKTCPQ:	MOVEI	T3,26		;"#", quoted with ^V: GTJFN% drops a bare #
+	IDPB	T3,T1
+	MOVEI	T3,"#"
+	IDPB	T3,T1
+	RET
+
+
+	LIT
+
+	END

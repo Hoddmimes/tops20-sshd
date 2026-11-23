@@ -1,0 +1,449 @@
+	TITLE	SSHLOG - TOPS-20 SSH server: login, capabilities, log file
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	CJBLK,ERRMSG,JOB,LINE,LOGJ,LOGNAM,LOGVER,MYUSR
+	EXTERN	ORIGPJ,PAY,PLEN,PTYJ,PTYNAM,PWA,PWL,R
+	EXTERN	RIX,U4GET,UNAM,UPSW
+	EXTERN	KEYAUT,ISSESS
+	INTERN	CAPCHK,CAPOFF,CAPON,CLRPW,CPYSTR,CPYSTU,GP32,GPBYT
+	INTERN	LOGFLS,LOGINI,OCTOUT,STREQ,TRYLOG
+
+SUBTTL	Phase 5: login
+
+;TRYLOG - check UNAM/UPSW and create a job logged in as UNAM on a PTY.
+;Skip return with JOB, PTYJ, LINE set.
+;
+;SECURITY: LOGIN% (also inside CRJOB%) skips the password check when
+;the new job's terminal is a PTY whose owning job is the same user or
+;has WHEEL/OPERATOR enabled in its top fork.  The access control job
+;here also refuses CRJOB% and ASND% without privileges.  So:
+;  1. The password is checked by CRJOB% of a DETACHED job (no PTY, so
+;     the PTY rule does not apply; LOGIN% does the full check with its
+;     bad-password penalty).  That job is logged out at once.
+;  2. Only then is the session job created on a PTY.
+;WHEEL is enabled only for these steps.  Logins as the server's own
+;user are refused outright.
+
+TRYKEY:	BLOCK	1		;This login was proven by a key signature
+
+TRYLOG:	MOVX	T1,RC%EMO	;User name -> user number (exact match)
+	HRROI	T2,UNAM
+	RCUSR%
+	 ERJMP	TRYLF0
+	TXNE	T1,RC%NOM!RC%AMB
+	 JRST	TRYLF0
+	CAMN	T3,MYUSR	;Same user as the server?
+	 JRST	[TMSG	<?Refused: logins as the server's own user
+>
+		 RET]
+	CALL	CAPON		;WHEEL on for the login steps
+	SETZM	TRYKEY
+	SKIPE	KEYAUT		;Key signature verified: no password
+	 JRST	[SETOM	TRYKEY	; (CJ%NPW below: LOGIN% skips the check,
+		 JRST	TRYLG1]	; allowed as we have WHEEL enabled)
+	CALL	CHKPW		;1. Verify the password (detached job)
+	 JRST	TRYLFP
+TRYLG1:	SETZM	KEYAUT		;Used once
+	CALL	GETPTY		;2. A PTY for the session
+	 JRST	[CALL	CAPOFF
+		 TMSG	<?No free PTY
+>
+		 RET]
+	MOVEI	T1,.TTDES	;Assign its TTY line to us (CRJOB% needs it)
+	ADD	T1,LINE
+	ASND%
+	 ERJMP	TRYLF1
+	SETZM	CJBLK		;Session job on the PTY line
+	MOVE	T1,[CJBLK,,CJBLK+1]
+	BLT	T1,CJBLK+17
+	MOVE	T1,[POINT 7,UNAM]
+	MOVEM	T1,CJBLK+.CJNAM
+	MOVE	T1,[POINT 7,UPSW]
+	MOVEM	T1,CJBLK+.CJPSW
+	MOVEI	T1,.TTDES
+	ADD	T1,LINE
+	MOVEM	T1,CJBLK+.CJTTY
+	MOVX	T1,CJ%LOG!CJ%NAM!CJ%ETF!CJ%OWN!FLD(.CJUDA,CJ%ACT)
+	SKIPE	TRYKEY		;Key login: no password check by LOGIN%
+	 TXO	T1,CJ%NPW
+	MOVEI	T2,CJBLK
+	CRJOB%
+	 ERJMP	TRYLF2
+	MOVEM	T1,JOB
+	CALL	CAPOFF
+	CALL	LOGFLS
+	RETSKP
+
+TRYLF0:	TMSG	<?Login failed: no such user
+>
+	CALL	LOGFLS
+	RET
+TRYLFP:	CALL	CAPOFF		;Password check failed
+	TMSG	<?Login failed: >
+	CALL	ERRMSG
+	CALL	LOGFLS
+	RET
+TRYLF1:	CALL	CAPOFF
+	TMSG	<?Can't assign the PTY line: >
+	JRST	TRYLF3
+TRYLF2:	CALL	CAPOFF
+	TMSG	<?Can't create the session job: >
+TRYLF3:	CALL	ERRMSG
+	MOVEI	T1,.TTDES	;Give the line back (may already be free)
+	ADD	T1,LINE
+	RELD%
+	 ERJMP	.+1
+	MOVE	T1,PTYJ
+	CLOSF%
+	 ERJMP	.+1
+	SETZM	PTYJ
+	CALL	LOGFLS
+	RET
+
+;CHKPW - verify UNAM/UPSW: CRJOB% a detached job (no terminal) logged in
+;with them, without updating the last-login date, and log it out again.
+;Skip return if the password is right.  Needs WHEEL/OPR enabled.
+
+CHKPW:	SETZM	CJBLK
+	MOVE	T1,[CJBLK,,CJBLK+1]
+	BLT	T1,CJBLK+17
+	MOVE	T1,[POINT 7,UNAM]
+	MOVEM	T1,CJBLK+.CJNAM
+	MOVE	T1,[POINT 7,UPSW]
+	MOVEM	T1,CJBLK+.CJPSW
+	MOVEI	T1,.NULIO	;No terminal: detached
+	MOVEM	T1,CJBLK+.CJTTY
+	MOVX	T1,CJ%LOG!CJ%NAM!CJ%NUD!FLD(.CJUDA,CJ%ACT)
+	MOVEI	T2,CJBLK
+	CRJOB%
+	 ERJMP	R		;Wrong password (or other login error)
+	LGOUT%			;Right: log the check job out again
+	 ERJMP	.+1
+	RETSKP
+
+;LOGINI - send all output (.PRIOU) to SSHD.LOG in the connected
+;directory, appending.  The server runs detached as a system job, so
+;a terminal is not a useful place for its messages.
+
+LOGINI:	SETZM	LOGVER		;LOGNAM without a generation number
+	SETZM	LOGFB
+	CALL	LOGNM
+	 RET
+	MOVX	T1,GJ%OLD!GJ%SHT
+	HRROI	T2,LOGNAM
+	GTJFN%
+	 ERJMP	LOGIN2
+LOGIN1:	MOVEM	T1,LOGJ
+	MOVX	T2,FLD(7,OF%BSZ)!OF%APP
+	OPENF%
+	 ERJMP	LOGIN3
+	MOVE	T1,LOGJ		;Close and reopen at once: a new file is
+	TXO	T1,CO%NRJ	; invisible until it has been closed
+	CLOSF%
+	 ERJMP	LOGIN3
+	MOVE	T1,LOGJ
+	MOVX	T2,FLD(7,OF%BSZ)!OF%APP
+	OPENF%
+	 ERJMP	LOGIN3
+	MOVE	T1,LOGJ		;Keep all generations (a restarted server
+	HRLI	T1,.FBBYV	; may write the next one while the old one
+	MOVX	T2,FB%RET	; still writes this one)
+	SETZ	T3,
+	CHFDB%
+	 ERJMP	.+1
+	MOVEI	T1,.FHSLF	;Primary output := the log file
+	GPJFN%
+	MOVEM	T2,ORIGPJ
+	HRR	T2,LOGJ
+	MOVEI	T1,.FHSLF
+	SPJFN%
+	 ERJMP	[TMSG <%Log: SPJFN failed: >
+		 JRST LOGERR]
+	TMSG	<
+=== SSHD started >
+	MOVEI	T1,.PRIOU
+	SETO	T2,
+	SETZ	T3,
+	ODTIM%
+	 ERJMP	.+1
+	TMSG	<
+>
+	SKIPN	LOGFB
+	 RET
+	TMSG	<[SSHD.LOG was in use (by the previous server): logging here]
+>
+	RET
+LOGIN2:	MOVX	T1,GJ%FOU!GJ%SHT	;No log, or it is in use: a new
+	HRROI	T2,LOGNAM		; generation
+	GTJFN%
+	 ERJMP	[TMSG <%Log: GTJFN failed: >
+		 JRST LOGERR]
+	JRST	LOGIN1
+LOGIN3:	MOVE	T1,LOGJ		;Can't open it (in use?)
+	RLJFN%
+	 ERJMP	.+1
+	SETZM	LOGJ
+	SKIPE	LOGFB		;Second failure: give up
+	 JRST	[TMSG <%Log: can't open >
+		 HRROI	T1,LOGNAM
+		 PSOUT%
+		 TMSG	<: >
+		 JRST	LOGERR]
+	SETOM	LOGFB		;Try a new generation once
+	JRST	LOGIN2
+LOGERR:	CALL	ERRMSG		;Report, keep output on the terminal
+	SETZM	LOGJ
+	RET
+LOGFB:	BLOCK	1		;Using a new generation (SSHD.LOG in use)
+
+;LOGNM - LOGNAM := "PS:<user>SSHD.LOG" (the job may have no connected
+;directory), with ".n" if LOGVER = n > 0.  Skip return if OK.
+
+LOGNM:	HRROI	T1,LOGNAM
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	PUSH	P,T1
+	GJINF%			;T1 = login user number (clobbers T1-T4)
+	MOVE	T2,T1
+	POP	P,T1
+	DIRST%
+	 ERJMP	[TMSG <%Log: DIRST failed: >
+		 JRST LOGERR]
+	HRROI	T2,[ASCIZ />SSHD.LOG/]
+	SETZ	T3,
+	SOUT%
+	SKIPG	T2,LOGVER
+	 JRST	LOGNM1
+	MOVEI	T3,"."
+	IDPB	T3,T1
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+LOGNM1:	SETZ	T3,
+	IDPB	T3,T1
+	RETSKP
+
+;LOGFLS - make the log file contents visible without closing it: set
+;the end-of-file pointer (.FBSIZ) in its FDB to the current position
+;and the byte size to 7.  Safe from any fork at any time (the forks all
+;write through the same JFN, so its pointer is the end of the data).
+
+LOGFLS:	SKIPN	LOGJ
+	 RET
+	MOVE	T1,LOGJ
+	RFPTR%			;T2 = bytes written so far
+	 ERJMP	R
+	PUSH	P,T2
+	MOVE	T1,LOGJ
+	HRLI	T1,.FBBYV	;Byte size 7
+	MOVX	T2,FB%BSZ
+	MOVX	T3,FLD(7,FB%BSZ)
+	CHFDB%
+	 ERJMP	.+1
+	POP	P,T3
+	MOVE	T1,LOGJ		;End of file
+	HRLI	T1,.FBSIZ
+	SETO	T2,
+	CHFDB%
+	 ERJMP	R
+	RET
+LOGFL9:	TMSG	<%Log: reopen failed: >
+	CALL	ERRMSG
+	SETZM	LOGJ		;Log broken: stay on the original output
+	RET
+
+;CAPON / CAPOFF - enable all available capabilities in this fork /
+;disable WHEEL and OPERATOR in this fork.
+
+CAPON:	MOVEI	T1,.FHSLF
+	RPCAP%
+	MOVE	T3,T2		;Enabled := possible
+	MOVEI	T1,.FHSLF
+	EPCAP%
+	 ERJMP	.+1
+	RET
+CAPOFF:	MOVEI	T1,.FHSLF
+	RPCAP%
+	TXZ	T3,SC%WHL!SC%OPR
+	MOVEI	T1,.FHSLF
+	EPCAP%
+	 ERJMP	.+1
+	RET
+
+;CAPCHK - at startup: refuse to run if the top fork (EXEC) has WHEEL
+;or OPERATOR enabled (that disables password checking for our PTYs),
+;require WHEEL or OPERATOR to be available, disable them in this fork,
+;and remember our own user number.
+
+CAPCHK:	MOVEI	T1,.FHTOP
+	RPCAP%
+	 ERJMP	.+1
+	TXNN	T3,SC%WHL!SC%OPR
+	 JRST	CAPCH1
+	TMSG	<?WHEEL/OPERATOR is enabled in the EXEC.  That would make TOPS-20
+ skip password checks for SSH logins.  Type DISABLE and run SSHD again.
+>
+	CALL	LOGFLS
+	HALTF%
+	JRST	CAPCHK
+CAPCH1:	MOVEI	T1,.FHSLF
+	RPCAP%
+	TXNN	T2,SC%WHL!SC%OPR
+	 JRST	[TMSG	<?SSHD needs WHEEL or OPERATOR capability (not enabled)
+>
+		 CALL	LOGFLS
+		 HALTF%
+		 JRST	CAPCHK]
+	CALL	CAPOFF
+	GJINF%			;Our user number
+	MOVEM	T1,MYUSR
+	RET
+
+;GETPTY - open the first free PTY.  Skip return with PTYJ and LINE.
+
+GETPTY:	PUSH	P,Q1
+	PUSH	P,Q2
+	PUSH	P,Q3
+	MOVEI	T1,.PTYPA	;Number of PTYs ,, first PTY line
+	GETAB%
+	 ERJMP	GETPT9
+	HLRZ	Q2,T1
+	HRRZ	Q3,T1
+	SETZ	Q1,
+GETPT1:	CAML	Q1,Q2
+	 JRST	GETPT9
+	HRROI	T1,PTYNAM	;"PTYn:" (unit number in octal)
+	HRROI	T2,[ASCIZ /PTY/]
+	SETZ	T3,
+	SOUT%
+	MOVE	T2,Q1
+	MOVEI	T3,10
+	NOUT%
+	 JFCL
+	MOVEI	T2,":"
+	IDPB	T2,T1
+	SETZ	T2,
+	IDPB	T2,T1
+	MOVX	T1,GJ%SHT
+	HRROI	T2,PTYNAM
+	GTJFN%
+	 ERJMP	GETPT3
+	MOVEM	T1,PTYJ
+	MOVX	T2,FLD(7,OF%BSZ)!OF%RD!OF%WR
+	OPENF%
+	 ERJMP	GETPT2
+	MOVE	T1,Q1		;Got one
+	ADD	T1,Q3
+	MOVEM	T1,LINE
+	AOS	-3(P)
+	JRST	GETPT9
+GETPT2:	MOVE	T1,PTYJ		;In use: release and try the next
+	RLJFN%
+	 ERJMP	.+1
+	SETZM	PTYJ
+GETPT3:	AOJA	Q1,GETPT1
+GETPT9:	POP	P,Q3
+	POP	P,Q2
+	POP	P,Q1
+	RET
+
+;CPYSTR / CPYSTU - copy the string at T2 (T3 bytes) to the ASCIZ buffer
+;at T1 (max 39 characters; CPYSTU folds to upper case).  Skip return
+;if it fits and has no NUL.
+
+CPYSTU:	TDZA	T4,T4		;T4 = 0: fold
+CPYSTR:	SETO	T4,		;T4 = -1: keep case
+	CAILE	T3,^D39
+	 RET
+	PUSH	P,T2
+	PUSH	P,T3
+	PUSH	P,Q1
+	HRLI	T1,(POINT 7,)
+CPYST1:	SOJL	T3,CPYST3
+	MOVE	Q1,(T2)
+	ANDI	Q1,177
+	JUMPE	Q1,CPYST4	;NUL: refuse
+	JUMPN	T4,CPYST2
+	CAIL	Q1,"a"
+	 CAILE	Q1,"z"
+	  SKIPA
+	   SUBI	Q1,40
+CPYST2:	IDPB	Q1,T1
+	AOJA	T2,CPYST1
+CPYST3:	SETZ	Q1,
+	IDPB	Q1,T1
+	AOS	-3(P)
+CPYST4:	POP	P,Q1
+	POP	P,T3
+	POP	P,T2
+	RET
+
+;STREQ - skip return if the string at T2 (T3 bytes) equals the ASCIZ
+;text at T1.  Preserves T2, T3.
+
+STREQ:	PUSH	P,T2
+	PUSH	P,T3
+	HRLI	T1,(POINT 7,)
+STREQ1:	ILDB	T4,T1
+	JUMPE	T4,STREQ2	;End of text: equal if string ended
+	SOJL	T3,STREQ3	;String ended first
+	CAME	T4,(T2)
+	 JRST	STREQ3
+	AOJA	T2,STREQ1
+STREQ2:	JUMPN	T3,STREQ3
+	AOS	-2(P)
+STREQ3:	POP	P,T3
+	POP	P,T2
+	RET
+
+;CLRPW - wipe the password copies
+
+CLRPW:	SETZM	UPSW
+	MOVE	T1,[UPSW,,UPSW+1]
+	BLT	T1,UPSW+7
+	SKIPG	T3,PWL
+	 RET
+	MOVE	T2,PWA
+CLRPW1:	SETZM	(T2)
+	ADDI	T2,1
+	SOJG	T3,CLRPW1
+	SETZM	PWL
+	RET
+
+;GP32 - T1 := uint32 at PAY(RIX), RIX += 4.  Skip return if it fits.
+
+GP32:	MOVE	T1,RIX
+	ADDI	T1,4
+	CAMLE	T1,PLEN
+	 RET
+	MOVE	T2,RIX
+	ADDI	T2,PAY
+	CALL	U4GET
+	MOVEI	T2,4
+	ADDM	T2,RIX
+	RETSKP
+
+;GPBYT - T1 := byte at PAY(RIX), RIX += 1.  Skip return if it fits.
+
+GPBYT:	MOVE	T2,RIX
+	CAML	T2,PLEN
+	 RET
+	MOVE	T1,PAY(T2)
+	AOS	RIX
+	RETSKP
+
+;OCTOUT - print T2 in octal
+
+OCTOUT:	MOVEI	T1,.PRIOU
+	MOVEI	T3,10
+	NOUT%
+	 JFCL
+	RET
+
+
+	LIT
+
+	END

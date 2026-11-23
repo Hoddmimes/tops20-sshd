@@ -1,0 +1,447 @@
+	TITLE	SSHPKT - TOPS-20 SSH server: packets, payloads, network I/O
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	B1,CCBLK,CCINIT,CCXOR,KEYRX,KEYTX,LENC,NBUF
+	EXTERN	LGDEAD,LGTMO
+	EXTERN	NET,NETEOF,OBUF,OLEN,P1305,PAY,PK64,PKT
+	EXTERN	PLEN,R,RING,RINGR,RINGW,RIX,RNDGET,RNDTIM
+	EXTERN	RPDL,RSKP,RXENC,SEQI,SEQO,STH,STM,TAG
+	EXTERN	TXENC,U4,VC,VCLEN
+	INTERN	FLUSH,GETVER,GPSTR,OP32,OPASZ,OPB,OSTR,PUTN
+	INTERN	RCVPKT,RDRFRK,SNDPKT,U4GET,W2U4
+
+SUBTTL	Packet layer
+
+;SNDPKT - send the payload in OBUF (OLEN bytes).  Skip return if OK.
+;Before NEWKEYS: plain, block size 8 over the whole packet.
+;After: chacha20-poly1305@openssh.com, the length field is excluded
+;from the block alignment.
+
+SNDPKT:	MOVE	T1,OLEN		;Padding: 4..11 bytes
+	ADDI	T1,1
+	SKIPN	TXENC
+	 ADDI	T1,4		;Length field counts when not encrypted
+	ANDI	T1,7
+	MOVEI	Q1,^D8
+	SUB	Q1,T1		;Q1 = padding length
+	CAIGE	Q1,4
+	 ADDI	Q1,^D8
+	MOVE	Q2,OLEN		;Q2 = packet_length
+	ADD	Q2,Q1
+	ADDI	Q2,1
+	MOVE	T1,Q2		;Header
+	CALL	W2U4
+	MOVSI	T1,-4
+SNDPK1:	MOVE	T2,U4(T1)
+	MOVEM	T2,PKT(T1)
+	AOBJN	T1,SNDPK1
+	MOVEM	Q1,PKT+4
+	SETZ	T1,		;Payload
+SNDPK2:	CAML	T1,OLEN
+	 JRST	SNDPK3
+	MOVE	T2,OBUF(T1)
+	MOVEM	T2,PKT+5(T1)
+	AOJA	T1,SNDPK2
+SNDPK3:	MOVE	T1,OLEN		;Random padding
+	ADDI	T1,PKT+5
+	MOVE	T2,Q1
+	CALL	RNDGET
+	MOVE	Q3,Q2		;Q3 = bytes to send
+	ADDI	Q3,4
+	SKIPN	TXENC
+	 JRST	SNDPK4
+	MOVEI	T1,KEYTX	;Encrypt
+	MOVE	T2,SEQO
+	CALL	NONCE		;Set up STM, STH for this packet
+	MOVEI	T1,STH		;Length with the header key
+	MOVEI	T2,PKT
+	MOVEI	T3,4
+	CALL	CCXOR
+	MOVEI	T1,1		;Rest with the main key, counter 1
+	MOVEM	T1,STM+^D12
+	MOVEI	T1,STM
+	MOVEI	T2,PKT+4
+	MOVE	T3,Q2
+	CALL	CCXOR
+	MOVEI	T1,PK64		;Tag over the whole ciphertext
+	MOVEI	T2,PKT
+	MOVE	T3,Q3
+	MOVEI	T4,PKT(Q3)
+	CALL	P1305
+	ADDI	Q3,^D16
+SNDPK4:	MOVEI	T2,PKT
+	MOVE	T3,Q3
+	CALL	PUTN
+	 RET
+	CALL	FLUSH
+	AOS	T1,SEQO
+	AND	T1,[37777777777]
+	MOVEM	T1,SEQO
+	RETSKP
+
+;RCVPKT - receive one packet into PAY/PLEN; T1 := message type.
+;IGNORE and DEBUG messages are skipped.  Skip return if OK.
+
+RCVPKT:	CALL	RNDTIM		;Packet timing feeds the random pool
+	MOVEI	T2,PKT		;Length field
+	MOVEI	T3,4
+	CALL	GETN
+	 RET
+	SKIPN	RXENC
+	 JRST	RCVPK1
+	MOVSI	T1,-4		;Encrypted: decrypt a copy of it
+RCVPK2:	MOVE	T2,PKT(T1)
+	MOVEM	T2,LENC(T1)
+	AOBJN	T1,RCVPK2
+	MOVEI	T1,KEYRX
+	MOVE	T2,SEQI
+	CALL	NONCE
+	MOVEI	T1,STH
+	MOVEI	T2,LENC
+	MOVEI	T3,4
+	CALL	CCXOR
+	MOVEI	T2,LENC
+	JRST	RCVPK3
+RCVPK1:	MOVEI	T2,PKT
+RCVPK3:	CALL	U4GET		;T1 := packet_length
+	MOVE	Q2,T1
+	CAIL	Q2,5		;Sanity
+	 CAILE	Q2,MAXPKT
+	  JRST	RCVBAD
+	MOVE	T3,Q2		;Read the rest (+ tag when encrypted)
+	SKIPE	RXENC
+	 ADDI	T3,^D16
+	MOVEI	T2,PKT+4
+	CALL	GETN
+	 RET
+	SKIPN	RXENC
+	 JRST	RCVPK4
+	MOVEI	T1,PK64		;Check the tag
+	MOVEI	T2,PKT
+	MOVE	T3,Q2
+	ADDI	T3,4
+	MOVEI	T4,TAG
+	CALL	P1305
+	MOVSI	T1,-^D16
+	MOVEI	T2,PKT+4(Q2)
+	SETZ	T3,
+RCVPK5:	MOVE	T4,(T2)
+	XOR	T4,TAG(T1)
+	IOR	T3,T4
+	ADDI	T2,1
+	AOBJN	T1,RCVPK5
+	JUMPN	T3,RCVMAC
+	MOVEI	T1,1		;Decrypt with the main key, counter 1
+	MOVEM	T1,STM+^D12
+	MOVEI	T1,STM
+	MOVEI	T2,PKT+4
+	MOVE	T3,Q2
+	CALL	CCXOR
+RCVPK4:	MOVE	T1,PKT+4	;Payload = packet_length - padding - 1
+	MOVE	T2,Q2
+	SUB	T2,T1
+	SUBI	T2,1
+	JUMPLE	T2,RCVBAD
+	MOVEM	T2,PLEN
+	SETZ	T1,
+RCVPK6:	MOVE	T3,PKT+5(T1)
+	MOVEM	T3,PAY(T1)
+	ADDI	T1,1
+	CAMGE	T1,T2
+	 JRST	RCVPK6
+	AOS	T1,SEQI
+	AND	T1,[37777777777]
+	MOVEM	T1,SEQI
+	MOVE	T1,PAY		;Message type
+	CAIE	T1,SSHIGN
+	 CAIN	T1,SSHDBG
+	  JRST	RCVPKT		;Skip IGNORE and DEBUG
+	RETSKP
+
+RCVBAD:	TMSG	<?Bad packet length
+>
+	RET
+RCVMAC:	TMSG	<?Packet authentication failed
+>
+	RET
+
+;NONCE - T1/ 64-byte key (K2 || K1), T2/ sequence number.
+;Sets STM (main key, counter 0) and STH (header key, counter 0) with
+;the nonce = 64-bit big-endian sequence number, and PK64 := first
+;keystream block of STM (the Poly1305 key is its first 32 bytes).
+
+NONCE:	PUSH	P,T1
+	PUSH	P,T2
+	MOVE	T2,T1		;Main key = first 32 bytes
+	MOVEI	T1,STM
+	CALL	CCINIT
+	MOVE	T2,-1(P)	;Header key = last 32 bytes
+	ADDI	T2,^D32
+	MOVEI	T1,STH
+	CALL	CCINIT
+	POP	P,T2		;Word 15 = byte-swapped sequence number
+	MOVE	T1,T2
+	ANDI	T1,377
+	LSH	T1,^D8
+	MOVE	T3,T2
+	LSH	T3,-^D8
+	ANDI	T3,377
+	IOR	T1,T3
+	LSH	T1,^D8
+	MOVE	T3,T2
+	LSH	T3,-^D16
+	ANDI	T3,377
+	IOR	T1,T3
+	LSH	T1,^D8
+	MOVE	T3,T2
+	LSH	T3,-^D24
+	ANDI	T3,377
+	IOR	T1,T3
+	SETZM	STM+^D12
+	SETZM	STM+^D13
+	SETZM	STM+^D14
+	MOVEM	T1,STM+^D15
+	SETZM	STH+^D12
+	SETZM	STH+^D13
+	SETZM	STH+^D14
+	MOVEM	T1,STH+^D15
+	POP	P,T1
+	MOVEI	T1,STM		;Poly1305 key
+	MOVEI	T2,PK64
+	CALL	CCBLK
+	RET
+
+SUBTTL	Payload building and parsing
+
+;OPB - append byte T1 to OBUF
+
+OPB:	MOVE	T4,OLEN
+	ANDI	T1,377
+	MOVEM	T1,OBUF(T4)
+	AOS	OLEN
+	RET
+
+;OP32 - append uint32 T1
+
+OP32:	PUSH	P,T1
+	LSH	T1,-^D24
+	CALL	OPB
+	MOVE	T1,(P)
+	LSH	T1,-^D16
+	CALL	OPB
+	MOVE	T1,(P)
+	LSH	T1,-^D8
+	CALL	OPB
+	POP	P,T1
+	CALL	OPB
+	RET
+
+;OSTR - append an SSH string: T2/ bytes, T3/ length
+
+OSTR:	PUSH	P,T2
+	PUSH	P,T3
+	MOVE	T1,T3
+	CALL	OP32
+	POP	P,T3
+	POP	P,T2
+OPSTR1:	SOJL	T3,R
+	MOVE	T1,(T2)
+	CALL	OPB
+	AOJA	T2,OPSTR1
+
+;OPASZ - append the ASCIZ text at T2 as an SSH string
+
+OPASZ:	PUSH	P,T2
+	HRLI	T2,(POINT 7,)	;Count it
+	SETZ	T3,
+OPASZ1:	ILDB	T1,T2
+	JUMPE	T1,OPASZ2
+	AOJA	T3,OPASZ1
+OPASZ2:	MOVE	T1,T3
+	CALL	OP32
+	POP	P,T2
+	HRLI	T2,(POINT 7,)
+OPASZ3:	ILDB	T1,T2
+	JUMPE	T1,R
+	PUSH	P,T2
+	CALL	OPB
+	POP	P,T2
+	JRST	OPASZ3
+
+;GPSTR - parse an SSH string at PAY(RIX): T2/ address, T3/ length.
+;Skip return if it fits in the payload.
+
+GPSTR:	MOVE	T1,RIX
+	ADDI	T1,4
+	CAMLE	T1,PLEN
+	 RET
+	MOVE	T2,RIX
+	ADDI	T2,PAY
+	CALL	U4GET
+	MOVE	T3,T1
+	MOVE	T1,RIX
+	ADDI	T1,4
+	MOVE	T2,T1
+	ADD	T1,T3
+	CAMLE	T1,PLEN
+	 RET
+	MOVEM	T1,RIX
+	ADDI	T2,PAY
+	RETSKP
+
+;W2U4 - U4 := T1 as 4 big-endian bytes
+
+W2U4:	MOVE	T2,T1
+	LSH	T2,-^D24
+	ANDI	T2,377
+	MOVEM	T2,U4
+	MOVE	T2,T1
+	LSH	T2,-^D16
+	ANDI	T2,377
+	MOVEM	T2,U4+1
+	MOVE	T2,T1
+	LSH	T2,-^D8
+	ANDI	T2,377
+	MOVEM	T2,U4+2
+	MOVE	T2,T1
+	ANDI	T2,377
+	MOVEM	T2,U4+3
+	RET
+
+;U4GET - T1 := big-endian uint32 at T2 (4 bytes)
+
+U4GET:	MOVE	T1,0(T2)
+	LSH	T1,^D8
+	IOR	T1,1(T2)
+	LSH	T1,^D8
+	IOR	T1,2(T2)
+	LSH	T1,^D8
+	IOR	T1,3(T2)
+	RET
+
+SUBTTL	Network I/O
+
+;GETN - read T3 bytes into T2 (one per word) from the ring buffer that
+;the reader fork fills.  Waits (5 ms naps) for data.  Skip return if
+;OK, non-skip at end of stream.
+
+GETN:	JUMPLE	T3,RSKP
+GETN1:	MOVE	T1,RINGW
+	CAME	T1,RINGR	;Anything in the ring?
+	 JRST	GETN2		;Yes
+	SKIPE	NETEOF		;No: end of stream?
+	 RET
+	SKIPN	LGDEAD		;Still logging in, and too long?
+	 JRST	GETN1A
+	PUSH	P,T2
+	TIME%			;(T1 = ms since boot, clobbers T2)
+	POP	P,T2
+	CAMGE	T1,LGDEAD
+	 JRST	GETN1A
+	SETOM	LGTMO		;Yes: give up as at end of stream
+	RET
+GETN1A:	MOVEI	T1,5
+	DISMS%
+	JRST	GETN1
+GETN2:	MOVE	T1,RINGR
+	ANDI	T1,RMASK
+	MOVE	T4,RING(T1)
+	ANDI	T4,377
+	MOVEM	T4,(T2)
+	AOS	RINGR
+	ADDI	T2,1
+	SOJG	T3,GETN1
+	RETSKP
+
+;RDRFRK - the reader fork.  Shares memory with the main fork (CR%MAP).
+;Reads bytes from the TCP connection into RING; sets NETEOF and halts
+;at end of stream or on error.
+
+RDRFRK:	MOVE	P,[IOWD 40,RPDL]
+RDRF1:	MOVE	T1,RINGW	;Room in the ring?
+	SUB	T1,RINGR
+	CAIGE	T1,RSIZE
+	 JRST	RDRF2
+	MOVEI	T1,^D10		;Full: wait for the main fork
+	DISMS%
+	JRST	RDRF1
+RDRF2:	MOVE	T1,NET
+	BIN%
+	 ERJMP	RDRF9
+	MOVE	T3,RINGW
+	ANDI	T3,RMASK
+	MOVEM	T2,RING(T3)
+	AOS	RINGW
+	JRST	RDRF1
+RDRF9:	SETOM	NETEOF
+	HALTF%
+	JRST	RDRF9
+
+;PUTN - send T3 bytes from T2.  Skip return if OK.  Call FLUSH after.
+
+PUTN:	JUMPLE	T3,RSKP
+	PUSH	P,T3
+	MOVE	T1,[POINT 8,NBUF]
+PUTN1:	MOVE	T4,(T2)
+	IDPB	T4,T1
+	ADDI	T2,1
+	SOJG	T3,PUTN1
+	POP	P,T3
+	MOVE	T1,NET
+	MOVE	T2,[POINT 8,NBUF]
+	MOVN	T3,T3
+	SOUT%
+	 ERJMP	R
+	RETSKP
+
+;FLUSH - push buffered output.  SOUTR% is SOUT% plus "end of record",
+;so give it an empty string (AC3 = 0 stops at the first null byte).
+
+FLUSH:	MOVE	T1,NET
+	HRROI	T2,[ASCIZ //]
+	SETZ	T3,
+	SOUTR%
+	 ERJMP	.+1
+	RET
+
+;GETVER - read the client identification line into VC/VCLEN, skipping
+;lines that do not start with "SSH-".  Skip return if OK.
+
+GETVER:	SETZ	Q1,
+GETVR1:	MOVEI	T2,B1
+	MOVEI	T3,1
+	CALL	GETN
+	 RET
+	MOVE	T2,B1
+	CAIN	T2,12		;LF ends the line
+	 JRST	GETVR2
+	CAIN	T2,15		;CR is dropped
+	 JRST	GETVR1
+	CAIL	Q1,^D255
+	 JRST	GETVR1
+	MOVEM	T2,VC(Q1)
+	AOJA	Q1,GETVR1
+GETVR2:	MOVEM	Q1,VCLEN
+	CAIL	Q1,4
+	 SKIPA
+	  JRST	GETVER
+	MOVE	T1,VC
+	CAIE	T1,"S"
+	 JRST	GETVER
+	MOVE	T1,VC+1
+	CAIE	T1,"S"
+	 JRST	GETVER
+	MOVE	T1,VC+2
+	CAIE	T1,"H"
+	 JRST	GETVER
+	MOVE	T1,VC+3
+	CAIE	T1,"-"
+	 JRST	GETVER
+	RETSKP
+
+
+	LIT
+
+	END

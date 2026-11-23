@@ -1,0 +1,596 @@
+	TITLE	SSHCON - TOPS-20 SSH server: connection protocol (RFC 4254)
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	CHOPEN,CLOSED,CLRPW,DECOUT,GP32,GPBYT,GPSTR,JOB
+	EXTERN	LINE,LWIN,NETEOF,OLEN,OP32,OPASZ,OPB,OSTR
+	EXTERN	PCNT,PDAT,PRSTR,PTYBUF,PTYJ,R,RCHAN,RCVPKT
+	EXTERN	RINGR,RINGW,RIX,RMAXP,RQW,RSKP,RWIN,SEQI
+	EXTERN	SHELL,SNDPKT,STREQ,WORK
+	EXTERN	LGTMO
+IFN FTSCP,<	EXTERN	SCPREQ,SCPRUN,SCPDAT,SCPMOD,SCPGO,SLOST
+>
+	INTERN	NETMSG,DISPAT,CEOF,EXCODE
+	INTERN	CONN,ENDJOB,LOGJ,LOGNAM,LOGVER,MYUSR,ORIGPJ
+
+SUBTTL	Phase 5: connection protocol (RFC 4254)
+
+OCHAN:	BLOCK	1		;CHANNEL_OPEN values before acceptance
+OWIN:	BLOCK	1
+OMAXP:	BLOCK	1
+MYUSR:	BLOCK	1		;User number the server runs as
+LOGJ:	BLOCK	1		;Log file JFN (0 = none)
+LOGNAM:	BLOCK	^D20		;Log file name
+LOGVER:	BLOCK	1		;Log version tried (0 = default)
+ORIGPJ:	BLOCK	1		;Original primary JFNs (input,,output)
+
+;CONN - main loop after login.  Returns (from SESSN) when the session
+;is over.
+
+CONN:	SETZM	CHOPEN
+	SETZM	SHELL
+	SETZM	CLOSED
+CONNL:	SETZM	WORK
+	MOVE	T1,RINGW	;Packet data waiting?
+	CAMN	T1,RINGR
+	 JRST	CONN1
+	CALL	RCVPKT
+	 JRST	CONNNE		;Network error or end: session over
+	CALL	DISPAT
+	 RET			;Session over
+	SETOM	WORK
+CONN1:
+IFN FTSCP,<
+	SKIPN	SCPGO		;scp accepted (exec): run it now
+	 JRST	CONN1A
+	CALL	SCPRUN
+	SKIPE	SLOST		;Connection lost or stalled: session over
+	 JRST	CONNNE
+	CALL	EXSTAT		;Its exit status, then EOF + CLOSE
+	CALL	CHCLOS
+	SETOM	WORK
+>
+CONN1A:	SKIPN	SHELL		;Relay only once the shell runs
+	 JRST	CONN2
+	SKIPE	CLOSED		; and until we have closed
+	 JRST	CONN2
+	CALL	PTYRD		;Job output -> CHANNEL_DATA
+	CALL	JOBCHK		;Still logged in?
+	 JRST	CONNJE		;No
+CONN2:	SKIPN	NETEOF		;Stream ended and ring drained?
+	 JRST	CONN3
+	MOVE	T1,RINGW
+	CAMN	T1,RINGR
+	 JRST	CONNNE
+CONN3:	SKIPE	WORK
+	 JRST	CONNL
+	MOVEI	T1,^D20		;Idle: nap 20 ms
+	DISMS%
+	JRST	CONNL
+
+CONNNE:	CALL	NETMSG		;Connection ended
+	RET
+
+;NETMSG - log why the connection ended: the client closed it (end of
+;stream and everything read) or something went wrong.
+
+NETMSG:	SKIPN	LGTMO		;A deadline passed
+	 JRST	NETMS0
+	SKIPE	JOB		;Logged in: a transfer stalled
+	 JRST	[TMSG	<[Timeout: no data from the client, closing the connection]
+>
+		 RET]
+	TMSG	<[Login timeout: closing the connection]
+>
+	RET
+NETMS0:
+	SKIPN	NETEOF
+	 JRST	NETMS1
+	MOVE	T1,RINGW
+	CAME	T1,RINGR
+	 JRST	NETMS1
+	TMSG	<[Client disconnected]
+>
+	RET
+NETMS1:	TMSG	<?Network error or bad packet
+>
+	RET
+
+CONNJE:	TMSG	<[User job logged out]
+>
+	SETZM	JOB		;Nothing left to log out
+	CALL	PTYRD		;Last output
+	SKIPN	T1,PTYJ		;Close the PTY at once: no new job may
+	 JRST	CONNJ1		; start on it
+	CLOSF%
+	 ERJMP	.+1
+	SETZM	PTYJ
+CONNJ1:	SETZM	EXCODE		;exit-status 0: a normal logout
+	CALL	EXSTAT
+	CALL	CHCLOS		;EOF + CLOSE; wait for the client's CLOSE
+	JRST	CONNL
+
+;DISPAT - handle one received message, type in T1.
+;Skip return to continue, non-skip when the session is over.
+
+DISPAT:	MOVEI	T2,1
+	MOVEM	T2,RIX
+	CAIN	T1,SSHDIS	;DISCONNECT from the client
+	 JRST	[TMSG	<[Client disconnected]
+>
+		 RET]
+	CAIN	T1,SSHGRQ
+	 JRST	DGLOB
+	CAIN	T1,SSHCOP
+	 JRST	DOPEN
+	CAIN	T1,SSHCWA
+	 JRST	DWADJ
+	CAIN	T1,SSHCDA
+	 JRST	DDATA
+	CAIN	T1,SSHCXD
+	 JRST	DXDAT
+	CAIN	T1,SSHCCL
+	 JRST	DCLOSE
+	CAIN	T1,SSHCRQ
+	 JRST	DREQ
+	CAIN	T1,SSHCEF	;EOF: noted (scp needs it)
+	 JRST	[SETOM	CEOF
+		 RETSKP]
+	CAIN	T1,SSHCSU	;Replies, late userauth: ignore
+	 RETSKP
+	CAIE	T1,SSHCFA
+	 CAIN	T1,SSHUAR
+	  RETSKP
+	CAIN	T1,SSHUNI
+	 RETSKP
+	SETZM	OLEN		;Anything else: UNIMPLEMENTED
+	MOVEI	T1,SSHUNI
+	CALL	OPB
+	MOVE	T1,SEQI		;Sequence number of that packet
+	SUBI	T1,1
+	AND	T1,[37777777777]
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	RETSKP
+
+;GLOBAL_REQUEST: refuse if a reply is wanted
+
+DGLOB:	CALL	GPSTR		;request name
+	 RETSKP
+	CALL	GPBYT		;want_reply
+	 RETSKP
+	JUMPE	T1,RSKP
+	SETZM	OLEN
+	MOVEI	T1,SSHRQF
+	CALL	OPB
+	CALL	SNDPKT
+	 JFCL
+	RETSKP
+
+;CHANNEL_OPEN: accept one "session" channel
+
+DOPEN:	CALL	GPSTR		;channel type
+	 RETSKP
+	PUSH	P,T2
+	PUSH	P,T3
+	CALL	GP32		;sender channel
+	 JRST	DOPEN9
+	MOVEM	T1,OCHAN
+	CALL	GP32		;initial window
+	 JRST	DOPEN9
+	MOVEM	T1,OWIN
+	CALL	GP32		;maximum packet
+	 JRST	DOPEN9
+	MOVEM	T1,OMAXP
+	POP	P,T3
+	POP	P,T2
+	SKIPE	CHOPEN		;Only one channel
+	 JRST	DOPEN8
+	HRROI	T1,[ASCIZ /session/]
+	CALL	STREQ
+	 JRST	DOPEN8
+	MOVE	T1,OCHAN	;Accepted: remember the client's values
+	MOVEM	T1,RCHAN
+	MOVE	T1,OWIN
+	MOVEM	T1,RWIN
+	MOVE	T1,OMAXP
+	MOVEM	T1,RMAXP
+	SETOM	CHOPEN
+	MOVEI	T1,LWINI
+	MOVEM	T1,LWIN
+	SETZM	OLEN		;CHANNEL_OPEN_CONFIRMATION
+	MOVEI	T1,SSHCOC
+	CALL	OPB
+	MOVE	T1,RCHAN	;recipient = client's channel
+	CALL	OP32
+	SETZ	T1,		;sender = our channel 0
+	CALL	OP32
+	MOVEI	T1,LWINI
+	CALL	OP32
+	MOVEI	T1,LMAXP
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	TMSG	<[Session channel open]
+>
+	RETSKP
+DOPEN8:	SETZM	OLEN		;CHANNEL_OPEN_FAILURE
+	MOVEI	T1,SSHCOF
+	CALL	OPB
+	MOVE	T1,OCHAN
+	CALL	OP32
+	MOVEI	T1,1		;ADMINISTRATIVELY_PROHIBITED
+	CALL	OP32
+	MOVEI	T2,[ASCIZ /Only one session channel is supported/]
+	CALL	OPASZ
+	SETZ	T1,
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	RETSKP
+DOPEN9:	POP	P,T3
+	POP	P,T2
+	RETSKP
+
+;CHANNEL_WINDOW_ADJUST: the client lets us send more
+
+DWADJ:	CALL	GP32		;recipient
+	 RETSKP
+	CALL	GP32		;bytes to add
+	 RETSKP
+	ADDM	T1,RWIN
+	RETSKP
+
+;CHANNEL_DATA: keystrokes for the job
+
+DDATA:	CALL	GP32		;recipient
+	 RETSKP
+	CALL	GPSTR		;data
+	 RETSKP
+	MOVN	T1,T3
+	ADDM	T1,LWIN
+IFN FTSCP,<
+	SKIPE	SCPMOD		;scp: the data is for it
+	 JRST	[CALL	SCPDAT
+		 JRST	DDATA2]
+>
+	SKIPN	PTYJ		;No job yet: discard
+	 JRST	DDATA2
+	PUSH	P,T2
+	PUSH	P,T3
+	CALL	JOBCHK		;Job still owns the line?  (After a logout
+	 JRST	[POP	P,T3	; a keystroke would start a new job on
+		 POP	P,T2	; our PTY: never let that happen)
+		 JRST	DDATA2]
+	POP	P,T3
+	POP	P,T2
+DDATA1:	SOJL	T3,DDATA2	;Type each byte into the PTY
+	PUSH	P,T2
+	PUSH	P,T3
+	MOVE	T2,(T2)
+	ANDI	T2,177
+	MOVE	T1,PTYJ
+	BOUT%
+	 ERJMP	.+1
+	POP	P,T3
+	POP	P,T2
+	AOJA	T2,DDATA1
+DDATA2:	CALL	WINCHK
+	RETSKP
+
+;CHANNEL_EXTENDED_DATA: not expected from a client; window only
+
+DXDAT:	CALL	GP32		;recipient
+	 RETSKP
+	CALL	GP32		;data type
+	 RETSKP
+	CALL	GPSTR
+	 RETSKP
+	MOVN	T1,T3
+	ADDM	T1,LWIN
+	CALL	WINCHK
+	RETSKP
+
+;WINCHK - open our window again when it is half used
+
+WINCHK:	MOVE	T1,LWIN
+	CAIL	T1,LWINI/2
+	 RET
+	SETZM	OLEN
+	MOVEI	T1,SSHCWA
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	MOVEI	T1,LWINI
+	SUB	T1,LWIN
+	CALL	OP32
+	MOVEI	T1,LWINI
+	MOVEM	T1,LWIN
+	CALL	SNDPKT
+	 JFCL
+	RET
+
+;CHANNEL_CLOSE: answer with our CLOSE (if not sent) and end
+
+DCLOSE:	SKIPE	CLOSED
+	 RET
+	TMSG	<[Client closed the session]
+>
+	SETZM	OLEN
+	MOVEI	T1,SSHCCL
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	SETOM	CLOSED
+	RET
+
+;CHANNEL_REQUEST: pty-req, shell, window-change
+
+DREQ:	CALL	GP32		;recipient
+	 RETSKP
+	CALL	GPSTR		;request type
+	 RETSKP
+	PUSH	P,T2
+	PUSH	P,T3
+	CALL	GPBYT		;want_reply
+	 SETZ	T1,
+	MOVEM	T1,RQW
+	POP	P,T3
+	POP	P,T2
+	HRROI	T1,[ASCIZ /pty-req/]
+	CALL	STREQ
+	 SKIPA
+	  JRST	DRQPTY
+	HRROI	T1,[ASCIZ /shell/]
+	CALL	STREQ
+	 SKIPA
+	  JRST	DRQSHL
+	HRROI	T1,[ASCIZ /window-change/]
+	CALL	STREQ
+	 SKIPA
+	  JRST	DRQWIN
+IFN FTSCP,<
+	HRROI	T1,[ASCIZ /exec/]
+	CALL	STREQ
+	 SKIPA
+	  JRST	DRQEXE
+	HRROI	T1,[ASCIZ /subsystem/]
+	CALL	STREQ
+	 SKIPA
+	  JRST	[TMSG	<[SFTP is not supported (use scp -O): subsystem refused]
+>
+		 JRST	DRQNO]
+>
+	TMSG	<[Refused channel request: >
+	CALL	PRSTR
+	TMSG	<]
+>
+	JRST	DRQNO
+
+DRQPTY:	CALL	GPSTR		;TERM
+	 JRST	DRQNO
+	TMSG	<[pty-req, TERM=>
+	CALL	PRSTR
+	TMSG	<]
+>
+	CALL	GP32		;width (characters)
+	 JRST	DRQNO
+	PUSH	P,T1
+	CALL	GP32		;height (rows)
+	 SETZ	T1,
+	MOVE	T2,T1
+	POP	P,T1
+	CALL	SETTTY
+	JRST	DRQYES
+
+IFN FTSCP,<
+DRQEXE:	CALL	GPSTR		;The command: only scp is done
+	 JRST	DRQNO
+	SKIPN	SHELL		;(Not on top of a shell)
+	 SKIPE	SCPGO
+	  JRST	DRQNO
+	PUSH	P,T2
+	PUSH	P,T3
+	CALL	SCPREQ
+	 JRST	[TMSG	<[Refused exec request: >
+		 POP	P,T3
+		 POP	P,T2
+		 CALL	PRSTR
+		 TMSG	<]
+>
+		 JRST	DRQNO]
+	POP	P,T3
+	POP	P,T2
+	JRST	DRQYES
+>
+
+DRQSHL:	SKIPN	PTYJ
+	 JRST	DRQNO
+	SETOM	SHELL
+	TMSG	<[Shell started]
+>
+	JRST	DRQYES
+
+DRQWIN:	CALL	GP32		;width
+	 RETSKP
+	PUSH	P,T1
+	CALL	GP32		;height
+	 SETZ	T1,
+	MOVE	T2,T1
+	POP	P,T1
+	CALL	SETTTY
+	JRST	DRQYES
+
+DRQYES:	MOVEI	T1,SSHCSU
+	JRST	DRQREP
+DRQNO:	MOVEI	T1,SSHCFA
+DRQREP:	SKIPN	RQW
+	 RETSKP
+	SETZM	OLEN
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	RETSKP
+
+;SETTTY - T1/ width, T2/ height: set the PTY line's width and length
+
+SETTTY:	PUSH	P,T2
+	SKIPLE	T3,T1
+	 CAILE	T3,^D255
+	  JRST	SETTT1
+	MOVEI	T1,.TTDES
+	ADD	T1,LINE
+	MOVEI	T2,.MOSLW
+	MTOPR%
+	 ERJMP	.+1
+SETTT1:	POP	P,T3
+	JUMPLE	T3,R
+	CAILE	T3,^D127
+	 RET
+	MOVEI	T1,.TTDES
+	ADD	T1,LINE
+	MOVEI	T2,.MOSLL
+	MTOPR%
+	 ERJMP	.+1
+	RET
+
+;PTYRD - send the job's terminal output as CHANNEL_DATA
+
+PTYRD:	SKIPG	RWIN		;Client window open?
+	 RET
+	MOVEI	T1,.TTDES	;Characters waiting in the line's
+	ADD	T1,LINE		; output buffer?
+	SOBE%
+	 JRST	PTYRD1		;Yes, count in T2
+	RET			;Empty
+PTYRD1:	CAMLE	T2,RWIN
+	 MOVE	T2,RWIN
+	CAMLE	T2,RMAXP
+	 MOVE	T2,RMAXP
+	CAILE	T2,PCHUNK
+	 MOVEI	T2,PCHUNK
+	JUMPLE	T2,R
+	MOVEM	T2,PCNT
+	MOVN	T3,T2		;Read exactly that many: no blocking
+	MOVE	T1,PTYJ
+	MOVE	T2,[POINT 7,PTYBUF]
+	SIN%
+	 ERJMP	R
+	MOVE	T1,[POINT 7,PTYBUF] ;Unpack
+	SETZ	T3,
+PTYRD2:	CAML	T3,PCNT
+	 JRST	PTYRD3
+	ILDB	T2,T1
+	MOVEM	T2,PDAT(T3)
+	AOJA	T3,PTYRD2
+PTYRD3:	SETZM	OLEN		;CHANNEL_DATA
+	MOVEI	T1,SSHCDA
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	MOVEI	T2,PDAT
+	MOVE	T3,PCNT
+	CALL	OSTR
+	CALL	SNDPKT
+	 JFCL
+	MOVN	T1,PCNT
+	ADDM	T1,RWIN
+	SETOM	WORK
+	RET
+
+;JOBCHK - skip return if the user's job still controls the PTY line
+
+JOBCHK:	SKIPN	JOB
+	 RET
+	HRLZ	T1,LINE
+	HRRI	T1,.TTYJO
+	GETAB%
+	 ERJMP	RSKP		;Can't tell: assume alive
+	HLRZ	T1,T1
+	CAMN	T1,JOB
+	 RETSKP
+	RET
+
+;Exit status and client EOF (also used by scp, when assembled in)
+
+EXCODE:	BLOCK	1		;exit-status to send
+CEOF:	BLOCK	1		;Client sent CHANNEL_EOF
+
+;EXSTAT - CHANNEL_REQUEST "exit-status" (no reply wanted), status 0,
+;so that the client exits with status 0 rather than reporting none
+
+EXSTAT:	SKIPN	CHOPEN		;(status in EXCODE)
+	 RET
+	SKIPE	CLOSED
+	 RET
+	SETZM	OLEN
+	MOVEI	T1,SSHCRQ
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	MOVEI	T2,[ASCIZ /exit-status/]
+	CALL	OPASZ
+	SETZ	T1,		;want_reply FALSE
+	CALL	OPB
+	MOVE	T1,EXCODE	;Exit status
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	TMSG	<[Sent exit-status >
+	MOVE	T2,EXCODE
+	CALL	DECOUT
+	TMSG	<]
+>
+	RET
+
+;CHCLOS - send CHANNEL_EOF and CHANNEL_CLOSE
+
+CHCLOS:	SKIPE	CLOSED
+	 RET
+	SETZM	OLEN
+	MOVEI	T1,SSHCEF
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	SETZM	OLEN
+	MOVEI	T1,SSHCCL
+	CALL	OPB
+	MOVE	T1,RCHAN
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	SETOM	CLOSED
+	RET
+
+;ENDJOB - log out the user's job and close the PTY
+
+ENDJOB:	CALL	CLRPW
+	SKIPN	T1,JOB
+	 JRST	ENDJB1
+	LGOUT%
+	 ERJMP	.+1
+	TMSG	<[Logged out job >
+	MOVE	T2,JOB
+	CALL	DECOUT
+	TMSG	<]
+>
+	SETZM	JOB
+ENDJB1:	SKIPN	T1,PTYJ
+	 RET
+	CLOSF%
+	 ERJMP	.+1
+	SETZM	PTYJ
+	RET
+
+
+	LIT
+
+	END

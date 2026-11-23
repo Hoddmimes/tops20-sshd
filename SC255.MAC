@@ -1,0 +1,210 @@
+	TITLE	SC25519 - arithmetic modulo the Ed25519 group order L
+
+;L = 2^252 + 27742317777372353535851937790883648493
+;
+;Numbers are handled as little-endian 16-bit digits, one per word,
+;so every digit product fits in a single word.  Reduction is plain
+;binary long division (shift in one bit, subtract L when possible).
+;
+;Calls (clobber T1-T4 only; bytes are one per word):
+;  T1/ out (32 bytes)  T2/ in (64 bytes)              CALL SCRED
+;      out = in mod L
+;  T1/ out  T2/ a  T3/ b  T4/ c   (32 bytes each)     CALL SCMULA
+;      out = (a*b + c) mod L
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	SCRED,SCMULA
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	I=5
+	J=6
+	CY=7			;Carry
+	X=10
+	Y=11
+	BITN=12			;Bit index for the division
+	OUTP=13
+	P=17
+
+ND==^D16			;Digits in a 256-bit number
+
+NUM:	BLOCK	2*ND		;512-bit dividend / product
+RR:	BLOCK	ND+1		;Remainder
+DA:	BLOCK	ND		;Operands as digits
+DB:	BLOCK	ND
+DC:	BLOCK	ND
+
+;L as 16-bit digits, least significant first
+
+LD:	EXP	151755,056365,061432,054022,116326,121367,174736,012336
+	EXP	0,0,0,0,0,0,0,10000
+
+DEFINE	SAVREG,<
+	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,10
+	PUSH	P,11
+	PUSH	P,12
+	PUSH	P,13
+>
+DEFINE	RSTREG,<
+	POP	P,13
+	POP	P,12
+	POP	P,11
+	POP	P,10
+	POP	P,7
+	POP	P,6
+	POP	P,5
+>
+
+SUBTTL	Entry points
+
+SCRED:	SAVREG
+	MOVE	OUTP,T1
+	MOVEI	T1,NUM		;64 bytes -> 32 digits
+	MOVEI	T3,2*ND
+	CALL	B2D
+	CALL	REDUCE
+	RSTREG
+	RET
+
+SCMULA:	SAVREG
+	MOVE	OUTP,T1
+	PUSH	P,T4
+	PUSH	P,T3
+	MOVEI	T1,DA		;a
+	MOVEI	T3,ND
+	CALL	B2D
+	POP	P,T2		;b
+	MOVEI	T1,DB
+	MOVEI	T3,ND
+	CALL	B2D
+	POP	P,T2		;c
+	MOVEI	T1,DC
+	MOVEI	T3,ND
+	CALL	B2D
+	SETZM	NUM		;NUM := 0
+	MOVE	T1,[NUM,,NUM+1]
+	BLT	T1,NUM+2*ND-1
+	SETZ	I,		;NUM := a * b (schoolbook)
+SCMU1:	SETZ	CY,
+	SETZ	J,
+SCMU2:	MOVE	X,DA(I)
+	IMUL	X,DB(J)		;< 2^32, fits
+	MOVE	Y,I
+	ADD	Y,J
+	ADD	X,NUM(Y)
+	ADD	X,CY
+	MOVE	CY,X
+	LSH	CY,-^D16
+	ANDI	X,177777
+	MOVEM	X,NUM(Y)
+	ADDI	J,1
+	CAIGE	J,ND
+	 JRST	SCMU2
+	MOVE	Y,I		;Final carry into NUM[i+ND]
+	ADDI	Y,ND
+	MOVEM	CY,NUM(Y)
+	ADDI	I,1
+	CAIGE	I,ND
+	 JRST	SCMU1
+	SETZ	CY,		;NUM += c
+	SETZ	I,
+SCMU3:	MOVE	X,NUM(I)
+	CAIGE	I,ND
+	 ADD	X,DC(I)
+	ADD	X,CY
+	MOVE	CY,X
+	LSH	CY,-^D16
+	ANDI	X,177777
+	MOVEM	X,NUM(I)
+	ADDI	I,1
+	CAIGE	I,2*ND
+	 JRST	SCMU3
+	CALL	REDUCE
+	RSTREG
+	RET
+
+SUBTTL	Subroutines
+
+;B2D - T1/ digit array, T2/ byte array, T3/ number of digits
+
+B2D:	MOVE	X,1(T2)
+	LSH	X,^D8
+	IOR	X,0(T2)
+	MOVEM	X,(T1)
+	ADDI	T1,1
+	ADDI	T2,2
+	SOJG	T3,B2D
+	RET
+
+;REDUCE - OUTP/ 32 bytes := NUM (32 digits) mod L
+
+REDUCE:	SETZM	RR		;RR := 0
+	MOVE	T1,[RR,,RR+1]
+	BLT	T1,RR+ND
+	MOVEI	BITN,^D511
+RED1:	MOVE	X,BITN		;Next bit of NUM, most significant first
+	LSH	X,-4
+	MOVE	CY,NUM(X)
+	MOVE	X,BITN
+	ANDI	X,17
+	MOVN	X,X
+	LSH	CY,(X)
+	ANDI	CY,1
+	SETZ	I,		;RR := 2*RR + bit
+RED2:	MOVE	X,RR(I)
+	LSH	X,1
+	IOR	X,CY
+	MOVE	CY,X
+	LSH	CY,-^D16
+	ANDI	X,177777
+	MOVEM	X,RR(I)
+	ADDI	I,1
+	CAIG	I,ND
+	 JRST	RED2
+	MOVEI	I,ND		;Compare RR with L, top digit first
+	SKIPE	RR+ND		;Digit ND is beyond L: RR > L
+	 JRST	RED5
+RED3:	SUBI	I,1
+	JUMPL	I,RED5		;All equal: RR = L, subtract
+	MOVE	X,RR(I)
+	CAMN	X,LD(I)
+	 JRST	RED3
+	CAMG	X,LD(I)		;RR > L?
+	 JRST	RED6		;No, RR < L
+RED5:	SETZB	I,CY		;RR := RR - L
+RED4:	MOVE	X,RR(I)
+	CAIGE	I,ND
+	 SUB	X,LD(I)
+	SUB	X,CY
+	SETZ	CY,
+	JUMPGE	X,RED7
+	ADDI	X,200000	;Borrow
+	MOVEI	CY,1
+RED7:	MOVEM	X,RR(I)
+	ADDI	I,1
+	CAIG	I,ND
+	 JRST	RED4
+RED6:	SOJGE	BITN,RED1
+	SETZ	I,		;Store RR as 32 bytes
+RED8:	MOVE	X,RR(I)
+	MOVE	Y,X
+	ANDI	Y,377
+	MOVEM	Y,(OUTP)
+	LSH	X,-^D8
+	MOVEM	X,1(OUTP)
+	ADDI	OUTP,2
+	ADDI	I,1
+	CAIGE	I,ND
+	 JRST	RED8
+	RET
+
+	LIT
+
+	END

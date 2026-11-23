@@ -1,0 +1,483 @@
+	TITLE	RSA - RSA signature verification for TOPS-20
+
+;RSASSA-PKCS1-v1_5 verification (RFC 8017) with SHA-256 or SHA-512, as
+;used by the SSH algorithms rsa-sha2-256 and rsa-sha2-512 (RFC 8332).
+;Moduli of 1024 to 4096 bits, public exponents below 2^32.
+;
+;Numbers are arrays of 32-bit limbs, least significant first.  s^e mod n
+;uses Montgomery multiplication (CIOS); MUL gives the 64-bit product of
+;two limbs in a double word (35 bits per word).
+;
+;Call:	T1/ argument block (all byte strings one byte per word, big-endian)
+;	  +RA.EA, +RA.EL	exponent e (mpint contents)
+;	  +RA.NA, +RA.NL	modulus n (mpint contents)
+;	  +RA.SA, +RA.SL	signature s
+;	  +RA.MA, +RA.ML	message
+;	  +RA.H			0 = SHA-256, 1 = SHA-512
+;	CALL	RSAVFY		;skip return if the signature is valid
+;Clobbers T1-T4 only.
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	RSAVFY
+	EXTERN	S256I,S256U,S256F,S512I,S512U,S512F
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	Q1=5
+	Q2=6
+	I=7
+	J=10
+	CY=11			;Carry
+	MW=12			;Multiplier limb
+	P=17
+
+RA.EA==0
+RA.EL==1
+RA.NA==2
+RA.NL==3
+RA.SA==4
+RA.SL==5
+RA.MA==6
+RA.ML==7
+RA.H==10
+
+KMAX==^D128			;Largest modulus: 128 limbs = 4096 bits
+NBMAX==KMAX*4
+NBMIN==^D128			;Smallest: 1024 bits
+
+ARGP:	BLOCK	1
+NK:	BLOCK	1		;Limbs in n
+NBY:	BLOCK	1		;Bytes in n
+EVAL:	BLOCK	1		;e
+EBIT:	BLOCK	1		;Bit of e being done
+NINV:	BLOCK	1		;-1/n mod 2^32
+BN:	BLOCK	KMAX+2		;n
+BS:	BLOCK	KMAX+2		;s
+BR2:	BLOCK	KMAX+2		;R^2 mod n, R = 2^(32 k)
+BSM:	BLOCK	KMAX+2		;s R mod n
+BX:	BLOCK	KMAX+2		;Running power
+BONE:	BLOCK	KMAX+2		;1
+BT:	BLOCK	KMAX+3		;Montgomery accumulator
+MA:	BLOCK	KMAX+2		;Montgomery operands
+MB:	BLOCK	KMAX+2
+MMD:	BLOCK	1		;Montgomery destination
+OUTB:	BLOCK	NBMAX		;s^e mod n as bytes
+HCTX:	BLOCK	^D200		;SHA context
+HASH:	BLOCK	^D64
+HLEN:	BLOCK	1
+
+RSAVFY:	PUSH	P,Q1
+	PUSH	P,Q2
+	PUSH	P,I
+	PUSH	P,J
+	PUSH	P,CY
+	PUSH	P,MW
+	MOVEM	T1,ARGP
+	CALL	RSAV
+	 SKIPA
+	AOS	-6(P)		;Valid
+	POP	P,MW
+	POP	P,CY
+	POP	P,J
+	POP	P,I
+	POP	P,Q2
+	POP	P,Q1
+	RET
+
+RSAV:	MOVE	Q1,ARGP
+	MOVE	T2,RA.NA(Q1)	;n: strip leading zero bytes
+	MOVE	T3,RA.NL(Q1)
+	CALL	STRIP
+	CAIL	T3,NBMIN
+	 CAILE	T3,NBMAX
+	  RET			;Size not supported
+	MOVEM	T3,NBY
+	ADDI	T3,3		;Limbs
+	LSH	T3,-2
+	MOVEM	T3,NK
+	MOVE	T3,NBY		;(T2 still points at n's first byte)
+	MOVEI	T1,BN
+	CALL	LOADBN
+	MOVE	T1,BN		;n must be odd
+	TRNN	T1,1
+	 RET
+	MOVE	T2,RA.EA(Q1)	;e: below 2^32, odd, at least 3
+	MOVE	T3,RA.EL(Q1)
+	CALL	STRIP
+	CAILE	T3,4
+	 RET
+	SETZ	T1,
+RSAV1:	SOJL	T3,RSAV2
+	LSH	T1,^D8
+	IOR	T1,(T2)
+	AOJA	T2,RSAV1
+RSAV2:	CAIL	T1,3
+	 TRNN	T1,1
+	  RET
+	MOVEM	T1,EVAL
+	MOVE	T2,RA.SA(Q1)	;s: at most as long as n, and below n
+	MOVE	T3,RA.SL(Q1)
+	CAMLE	T3,NBY
+	 RET
+	MOVEI	T1,BS
+	CALL	LOADBN
+	MOVEI	T1,BS
+	CALL	CMPN		;T1 = -1, 0, 1 for s <, =, > n
+	JUMPGE	T1,R
+
+	CALL	MKNINV		;-1/n mod 2^32
+	CALL	MKR2		;R^2 mod n
+	MOVEI	T1,BONE		;1
+	CALL	ZERO
+	MOVEI	T1,1
+	MOVEM	T1,BONE
+	MOVEI	T1,BSM		;sR = MM(s, R^2)
+	MOVEI	T2,BS
+	MOVEI	T3,BR2
+	CALL	MONT
+	MOVE	T1,[BSM,,BX]	;x = sR
+	BLT	T1,BX+KMAX+1
+	MOVE	T1,EVAL		;Bits of e below the top one
+	JFFO	T1,.+1
+	MOVEI	T1,^D35
+	SUB	T1,T2		;Top bit number
+	MOVEM	T1,EBIT
+RSAV3:	SOSGE	EBIT		;(MONT uses I, J, CY, MW)
+	 JRST	RSAV4
+	MOVEI	T1,BX		;x = x^2
+	MOVEI	T2,BX
+	MOVEI	T3,BX
+	CALL	MONT
+	MOVE	T1,EVAL
+	MOVN	T2,EBIT
+	LSH	T1,(T2)
+	TRNN	T1,1
+	 JRST	RSAV3
+	MOVEI	T1,BX		;x = x s
+	MOVEI	T2,BX
+	MOVEI	T3,BSM
+	CALL	MONT
+	JRST	RSAV3
+RSAV4:	MOVEI	T1,BX		;Out of Montgomery form
+	MOVEI	T2,BX
+	MOVEI	T3,BONE
+	CALL	MONT
+
+	MOVE	J,NBY		;x as NBY big-endian bytes
+	SETZ	T4,		;T4 = byte number from the end
+RSAV5:	SOJL	J,RSAV6
+	MOVE	T1,T4
+	LSH	T1,-2
+	MOVE	T1,BX(T1)
+	MOVE	T2,T4
+	ANDI	T2,3
+	IMULI	T2,-^D8
+	LSH	T1,(T2)
+	ANDI	T1,377
+	MOVEM	T1,OUTB(J)
+	AOJA	T4,RSAV5
+
+RSAV6:	MOVE	Q1,ARGP		;Hash the message
+	SKIPE	RA.H(Q1)
+	 JRST	RSAV7
+	MOVEI	T1,HCTX
+	CALL	S256I
+	MOVEI	T1,HCTX
+	MOVE	T2,RA.MA(Q1)
+	MOVE	T3,RA.ML(Q1)
+	CALL	S256U
+	MOVEI	T1,HCTX
+	MOVEI	T2,HASH
+	CALL	S256F
+	MOVEI	T1,^D32
+	MOVEI	Q2,DI256
+	JRST	RSAV8
+RSAV7:	MOVEI	T1,HCTX
+	CALL	S512I
+	MOVEI	T1,HCTX
+	MOVE	T2,RA.MA(Q1)
+	MOVE	T3,RA.ML(Q1)
+	CALL	S512U
+	MOVEI	T1,HCTX
+	MOVEI	T2,HASH
+	CALL	S512F
+	MOVEI	T1,^D64
+	MOVEI	Q2,DI512
+RSAV8:	MOVEM	T1,HLEN
+	;Expected: 00 01 FF..FF 00 DigestInfo(19) Hash
+	MOVE	T1,OUTB
+	JUMPN	T1,R
+	MOVE	T1,OUTB+1
+	CAIE	T1,1
+	 RET
+	MOVE	T3,NBY		;T3 = number of FF bytes
+	SUBI	T3,3+^D19
+	SUB	T3,HLEN
+	CAIGE	T3,^D8
+	 RET
+	MOVEI	J,2
+RSAV9:	MOVE	T1,OUTB(J)
+	CAIE	T1,377
+	 RET
+	ADDI	J,1
+	SOJG	T3,RSAV9
+	SKIPE	OUTB(J)		;The 00 separator
+	 RET
+	ADDI	J,1
+	MOVSI	T4,-^D19	;DigestInfo
+RSAV10:	HRRZ	T2,T4
+	ADD	T2,Q2
+	MOVE	T1,OUTB(J)
+	CAME	T1,(T2)
+	 RET
+	ADDI	J,1
+	AOBJN	T4,RSAV10
+	MOVN	T4,HLEN		;The hash
+	HRLZS	T4
+RSAV11:	MOVE	T1,OUTB(J)
+	CAME	T1,HASH(T4)
+	 RET
+	ADDI	J,1
+	AOBJN	T4,RSAV11
+	RETSKP
+
+;STRIP - T2/T3 = bytes/count: skip leading zero bytes
+
+STRIP:	JUMPLE	T3,R
+	SKIPE	(T2)
+	 RET
+	ADDI	T2,1
+	SOJA	T3,STRIP
+
+;ZERO - clear the number at T1 (KMAX+2 limbs)
+
+ZERO:	SETZM	(T1)
+	HRLS	T1
+	ADDI	T1,1
+	MOVE	T2,T1
+	BLT	T1,KMAX(T2)
+	RET
+
+;LOADBN - number at T1 := big-endian bytes T2, count T3
+
+LOADBN:	PUSH	P,T1
+	PUSH	P,T2
+	CALL	ZERO		;(clobbers T2)
+	POP	P,T2
+	POP	P,T1
+	ADD	T2,T3		;T2 = just past the last byte
+	SETZ	T4,		;T4 = byte number from the end
+LOADB1:	SOJL	T3,R
+	SUBI	T2,1
+	MOVE	Q2,(T2)
+	ANDI	Q2,377
+	MOVE	CY,T4
+	ANDI	CY,3
+	IMULI	CY,^D8
+	LSH	Q2,(CY)
+	MOVE	CY,T4
+	LSH	CY,-2
+	ADD	CY,T1
+	IORM	Q2,(CY)
+	AOJA	T4,LOADB1
+
+;CMPN - compare the number at T1 (NK+1 limbs) with n: T1 := -1, 0, 1
+
+CMPN:	MOVE	J,NK
+	ADD	T1,J
+	SKIPE	(T1)		;Top limb (above n)
+	 JRST	CMPN3
+CMPN1:	SOJL	J,CMPN4
+	SUBI	T1,1
+	MOVE	T2,(T1)
+	CAMN	T2,BN(J)
+	 JRST	CMPN1
+	CAML	T2,BN(J)
+	 JRST	CMPN3
+	SETO	T1,		;Less
+	RET
+CMPN3:	MOVEI	T1,1		;Greater
+	RET
+CMPN4:	SETZ	T1,		;Equal
+	RET
+
+;SUBN - number at T1 (NK+1 limbs) -= n
+
+SUBN:	SETZ	CY,		;Borrow
+	SETZ	J,
+SUBN1:	MOVE	T2,(T1)
+	SUB	T2,BN(J)
+	SUB	T2,CY
+	SETZ	CY,
+	JUMPGE	T2,SUBN2
+	ADD	T2,[1B3]	;+2^32
+	MOVEI	CY,1
+SUBN2:	MOVEM	T2,(T1)
+	ADDI	T1,1
+	ADDI	J,1
+	CAMG	J,NK		;(limb NK too)
+	 JRST	SUBN1
+	RET
+
+;MKNINV - NINV := -1/n[0] mod 2^32 (Newton: x := x (2 - n x))
+
+MKNINV:	MOVE	Q2,BN		;x = n[0] (right mod 8)
+	MOVEI	J,4
+MKNIN1:	MOVE	T3,BN
+	MUL	T3,Q2
+	AND	T4,[37777777777] ;n x mod 2^32
+	MOVEI	T2,2
+	SUB	T2,T4
+	AND	T2,[37777777777]
+	MOVE	T3,Q2
+	MUL	T3,T2
+	AND	T4,[37777777777]
+	MOVE	Q2,T4
+	SOJG	J,MKNIN1
+	MOVN	T1,Q2
+	AND	T1,[37777777777]
+	MOVEM	T1,NINV
+	RET
+
+;MKR2 - BR2 := 2^(64 k) mod n by doubling 1 that many times
+
+MKR2:	MOVEI	T1,BR2
+	CALL	ZERO
+	MOVEI	T1,1
+	MOVEM	T1,BR2
+	MOVE	I,NK
+	LSH	I,6		;64 k doublings
+MKR21:	SETZ	CY,		;BR2 = 2 BR2 (NK+1 limbs)
+	SETZ	J,
+MKR22:	MOVE	T1,BR2(J)
+	LSH	T1,1
+	IOR	T1,CY
+	MOVE	CY,T1
+	LSH	CY,-^D32
+	AND	T1,[37777777777]
+	MOVEM	T1,BR2(J)
+	ADDI	J,1
+	CAMG	J,NK
+	 JRST	MKR22
+	MOVEI	T1,BR2		;>= n: subtract it
+	CALL	CMPN
+	JUMPL	T1,MKR23
+	MOVEI	T1,BR2
+	CALL	SUBN
+MKR23:	SOJG	I,MKR21
+	RET
+
+;MONT - T1 := T2 * T3 / R mod n (Montgomery, CIOS).  T1 may be T2/T3.
+
+MONT:	MOVEM	T1,MMD
+	HRLZ	T1,T2		;Copy the operands
+	HRRI	T1,MA
+	BLT	T1,MA+KMAX+1
+	HRLZ	T1,T3
+	HRRI	T1,MB
+	BLT	T1,MB+KMAX+1
+	SETZM	BT
+	MOVE	T1,[BT,,BT+1]
+	BLT	T1,BT+KMAX+2
+	SETZ	I,
+MONT1:	MOVE	MW,MB(I)	;t += a * b[i]
+	SETZ	CY,
+	SETZ	J,
+MONT2:	MOVE	T3,MA(J)
+	MUL	T3,MW
+	MOVE	T1,BT(J)
+	ADD	T1,CY
+	ADD	T4,T1
+	TLZE	T4,400000
+	 ADDI	T3,1
+	MOVE	T1,T4
+	LSH	T1,-^D32
+	LSH	T3,3
+	IOR	T3,T1
+	MOVE	CY,T3
+	AND	T4,[37777777777]
+	MOVEM	T4,BT(J)
+	ADDI	J,1
+	CAMGE	J,NK
+	 JRST	MONT2
+	MOVE	T1,BT(J)	;t[k], t[k+1]
+	ADD	T1,CY
+	MOVE	T2,T1
+	AND	T1,[37777777777]
+	MOVEM	T1,BT(J)
+	LSH	T2,-^D32
+	MOVEM	T2,BT+1(J)
+	MOVE	T3,BT		;m = t[0] n' mod 2^32
+	MUL	T3,NINV
+	AND	T4,[37777777777]
+	MOVE	MW,T4
+	MOVE	T3,BN		;t += m n, shifted down one limb
+	MUL	T3,MW
+	ADD	T4,BT
+	TLZE	T4,400000
+	 ADDI	T3,1
+	MOVE	T1,T4
+	LSH	T1,-^D32
+	LSH	T3,3
+	IOR	T3,T1
+	MOVE	CY,T3
+	MOVEI	J,1
+MONT3:	CAML	J,NK
+	 JRST	MONT4
+	MOVE	T3,BN(J)
+	MUL	T3,MW
+	MOVE	T1,BT(J)
+	ADD	T1,CY
+	ADD	T4,T1
+	TLZE	T4,400000
+	 ADDI	T3,1
+	MOVE	T1,T4
+	LSH	T1,-^D32
+	LSH	T3,3
+	IOR	T3,T1
+	MOVE	CY,T3
+	AND	T4,[37777777777]
+	MOVEM	T4,BT-1(J)
+	AOJA	J,MONT3
+MONT4:	MOVE	T1,BT(J)
+	ADD	T1,CY
+	MOVE	T2,T1
+	AND	T1,[37777777777]
+	MOVEM	T1,BT-1(J)
+	LSH	T2,-^D32
+	ADD	T2,BT+1(J)
+	MOVEM	T2,BT(J)
+	SETZM	BT+1(J)
+	ADDI	I,1
+	CAMGE	I,NK
+	 JRST	MONT1
+	MOVEI	T1,BT		;t >= n: subtract n
+	CALL	CMPN
+	JUMPL	T1,MONT5
+	MOVEI	T1,BT
+	CALL	SUBN
+MONT5:	MOVE	T1,MMD		;Result (NK limbs, the rest zero)
+	CALL	ZERO
+	MOVE	T2,MMD
+	HRLZI	T1,BT
+	HRR	T1,T2
+	ADD	T2,NK
+	BLT	T1,-1(T2)
+	RET
+
+R:	RET
+RSKP:	AOS	(P)
+	RET
+
+;DigestInfo prefix for SHA-256 (19 bytes)
+DI256:	BYTE	(36) 60,61,60,15,6,11,140,206,110,1,145,3,4,2,1,5,0,4,40
+;DigestInfo prefix for SHA-512 (19 bytes)
+DI512:	BYTE	(36) 60,121,60,15,6,11,140,206,110,1,145,3,4,2,3,5,0,4,100
+
+	LIT
+
+	END

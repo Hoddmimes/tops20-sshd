@@ -1,0 +1,577 @@
+	TITLE	ED25519 - Ed25519 signatures for TOPS-20
+
+;RFC 8032 Ed25519 key generation, signing and verification (for
+;public key logins).
+;
+;Points use extended coordinates (X:Y:Z:T), x = X/Z, y = Y/Z, xy = T/Z,
+;on -x^2 + y^2 = 1 + d x^2 y^2.  Additions use the unified formula
+;(add-2008-hwcd-3), which also serves for doubling.  Scalar
+;multiplication always adds and selects with FCSWAP (constant time).
+;
+;Calls (clobber T1-T4 only; bytes are one per word):
+;  T1/ public (32)  T2/ secret (32)                    CALL EDPUB
+;  T1/ sig (64)  T2/ key (64: secret, then public)
+;      T3/ message  T4/ length                          CALL EDSIGN
+;  T1/ sig (64)  T2/ public key (32)
+;      T3/ message  T4/ length          CALL EDVRFY  skip return if valid
+;Verification is not constant time (it handles only public data).
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	EDPUB,EDSIGN,EDVRFY
+	EXTERN	FMUL,FSQ,FADD,FSUB,FCOPY,FINV,FZERO,FONE,FCSWAP,FTOBYT
+	EXTERN	FNEG,FFRBYT
+	EXTERN	S512I,S512U,S512F,SCRED,SCMULA
+	EXTERN	EDB,ED2D
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	TBIT=5			;Scalar bit index
+	KT=6			;Current scalar bit
+	SCP=7			;Scalar address
+	P=17
+
+;Point layout: X, Y, Z, T, each a 10-word field element
+
+PX==0
+PY==12
+PZ==24
+PT==36
+PSIZE==50
+
+SHACTX:	BLOCK	^D200		;SHA-512 context (S512SZ = 146 words)
+HASH:	BLOCK	^D64		;SHA-512 output
+AS:	BLOCK	^D32		;Clamped secret scalar a
+RS:	BLOCK	^D32		;Nonce r mod L
+KS:	BLOCK	^D32		;Challenge k mod L
+KEYP:	BLOCK	1		;Key address (EDSIGN)
+MSGP:	BLOCK	1		;Message address
+MSGL:	BLOCK	1		;Message length
+SIGP:	BLOCK	1		;Signature address
+OUTP:	BLOCK	1		;Output address (EDPUB)
+PQ:	BLOCK	PSIZE		;Points
+PR:	BLOCK	PSIZE
+PS:	BLOCK	PSIZE		;PADD result
+EA:	BLOCK	12		;PADD temporaries
+EB:	BLOCK	12
+EC:	BLOCK	12
+ED:	BLOCK	12
+EE:	BLOCK	12
+EF:	BLOCK	12
+EG:	BLOCK	12
+EH:	BLOCK	12
+ET:	BLOCK	12
+EU:	BLOCK	12
+XB:	BLOCK	^D32		;Encoding of x (for the sign bit)
+PP1:	BLOCK	1		;PADD operand addresses
+PP2:	BLOCK	1
+PP3:	BLOCK	1
+BASEP:	BLOCK	1		;Point to multiply (SMULP)
+VA:	BLOCK	PSIZE		;EDVRFY: -A
+VP:	BLOCK	PSIZE		; S*B
+VY:	BLOCK	12		; field temporaries
+VU:	BLOCK	12
+VV:	BLOCK	12
+VW:	BLOCK	12
+VX:	BLOCK	12
+VR:	BLOCK	12
+VT:	BLOCK	12
+VBYT:	BLOCK	^D32		; byte temporaries
+VBYT2:	BLOCK	^D32
+
+DEFINE	F3(OP,H,F,G),<
+	MOVEI	T1,H
+	MOVEI	T2,F
+	MOVEI	T3,G
+	CALL	OP
+>
+DEFINE	F2(OP,H,F),<
+	MOVEI	T1,H
+	MOVEI	T2,F
+	CALL	OP
+>
+
+;FP3 OP,H,OF,G,OG - three-operand field call with H fixed and point
+;operands F = @PP2+OF, G = @PP3+OG
+
+DEFINE	FP3(OP,H,OF,OG),<
+	MOVEI	T1,H
+	MOVE	T2,PP2
+	ADDI	T2,OF
+	MOVE	T3,PP3
+	ADDI	T3,OG
+	CALL	OP
+>
+
+SUBTTL	Point addition
+
+;PADD - T1/ result, T2/ p, T3/ q.  Result may alias p or q.
+
+PADD:	MOVEM	T1,PP1
+	MOVEM	T2,PP2
+	MOVEM	T3,PP3
+	MOVE	T2,PP2		;EA = Y1 - X1, EB = Y2 - X2
+	MOVEI	T1,EA
+	MOVEI	T3,PX(T2)
+	MOVEI	T2,PY(T2)
+	CALL	FSUB
+	MOVE	T2,PP3
+	MOVEI	T1,EB
+	MOVEI	T3,PX(T2)
+	MOVEI	T2,PY(T2)
+	CALL	FSUB
+	F3	FMUL,EA,EA,EB	;A = (Y1-X1)*(Y2-X2)
+	MOVE	T2,PP2		;EB = Y1 + X1, EC = Y2 + X2
+	MOVEI	T1,EB
+	MOVEI	T3,PX(T2)
+	MOVEI	T2,PY(T2)
+	CALL	FADD
+	MOVE	T2,PP3
+	MOVEI	T1,EC
+	MOVEI	T3,PX(T2)
+	MOVEI	T2,PY(T2)
+	CALL	FADD
+	F3	FMUL,EB,EB,EC	;B = (Y1+X1)*(Y2+X2)
+	FP3	FMUL,EC,PT,PT	;C = T1 * 2d * T2
+	F3	FMUL,EC,EC,ED2D
+	FP3	FMUL,ED,PZ,PZ	;D = 2 * Z1 * Z2
+	F3	FADD,ED,ED,ED
+	F3	FSUB,EE,EB,EA	;E = B - A
+	F3	FSUB,EF,ED,EC	;F = D - C
+	F3	FADD,EG,ED,EC	;G = D + C
+	F3	FADD,EH,EB,EA	;H = B + A
+	F3	FMUL,PS+PX,EE,EF ;X3 = E*F
+	F3	FMUL,PS+PY,EG,EH ;Y3 = G*H
+	F3	FMUL,PS+PT,EE,EH ;T3 = E*H
+	F3	FMUL,PS+PZ,EF,EG ;Z3 = F*G
+	MOVSI	T1,PS		;Copy the result
+	HRR	T1,PP1
+	MOVE	T2,PP1
+	BLT	T1,PSIZE-1(T2)
+	RET
+
+SUBTTL	Scalar multiplication by the base point
+
+;SMULB - PQ := scalar * B.  SCP/ scalar (32 bytes), bits 254..0 used.
+
+;SMULP - PQ := scalar * point.  SCP/ scalar, BASEP/ point address.
+
+SMULB:	MOVEI	T1,EDB		;Base point
+	MOVEM	T1,BASEP
+SMULP:	MOVEI	T1,PQ+PX	;Q = identity (0, 1, 1, 0)
+	CALL	FZERO
+	MOVEI	T1,PQ+PY
+	CALL	FONE
+	MOVEI	T1,PQ+PZ
+	CALL	FONE
+	MOVEI	T1,PQ+PT
+	CALL	FZERO
+	MOVEI	TBIT,^D254
+SMULB1:	MOVEI	T1,PQ		;Q = 2Q
+	MOVEI	T2,PQ
+	MOVEI	T3,PQ
+	CALL	PADD
+	MOVEI	T1,PR		;R = Q + base
+	MOVEI	T2,PQ
+	MOVE	T3,BASEP
+	CALL	PADD
+	MOVE	T1,TBIT		;Bit t of the scalar
+	LSH	T1,-3
+	ADD	T1,SCP
+	MOVE	KT,(T1)
+	MOVE	T1,TBIT
+	ANDI	T1,7
+	MOVN	T1,T1
+	LSH	KT,(T1)
+	ANDI	KT,1
+	MOVEI	T4,4		;If bit: Q = R (swap all 4 coordinates)
+	MOVEI	T1,PQ
+	MOVEI	T2,PR
+SMULB2:	PUSH	P,T4
+	PUSH	P,T1
+	PUSH	P,T2
+	MOVE	T3,KT
+	CALL	FCSWAP
+	POP	P,T2
+	POP	P,T1
+	POP	P,T4
+	ADDI	T1,12
+	ADDI	T2,12
+	SOJG	T4,SMULB2
+	SOJGE	TBIT,SMULB1
+	RET
+
+;ENCODE - T1/ 32 bytes := encoding of point PQ
+
+ENCODE:	MOVEM	T1,OUTP
+	F2	FINV,EU,PQ+PZ	;1/Z
+	F3	FMUL,ET,PQ+PX,EU ;x
+	F3	FMUL,EU,PQ+PY,EU ;y
+	MOVE	T1,OUTP
+	MOVEI	T2,EU
+	CALL	FTOBYT
+	F2	FTOBYT,XB,ET
+	MOVE	T1,XB		;Sign of x into bit 255
+	ANDI	T1,1
+	LSH	T1,7
+	MOVE	T2,OUTP
+	IORM	T1,^D31(T2)
+	RET
+
+;HSECRT - HASH := SHA-512(secret at T1), AS := clamped HASH[0..31]
+
+HSECRT:	PUSH	P,T1
+	MOVEI	T1,SHACTX
+	CALL	S512I
+	MOVEI	T1,SHACTX
+	POP	P,T2
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVEI	T2,HASH
+	CALL	S512F
+	MOVSI	T4,-^D32
+HSECR1:	MOVE	T1,HASH(T4)
+	MOVEM	T1,AS(T4)
+	AOBJN	T4,HSECR1
+	MOVEI	T1,370
+	ANDM	T1,AS
+	MOVEI	T1,177
+	ANDM	T1,AS+^D31
+	MOVEI	T1,100
+	IORM	T1,AS+^D31
+	RET
+
+SUBTTL	EDPUB, EDSIGN
+
+EDPUB:	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,T1
+	MOVE	T1,T2
+	CALL	HSECRT
+	MOVEI	SCP,AS		;A = a * B
+	CALL	SMULB
+	POP	P,T1
+	CALL	ENCODE
+	POP	P,7
+	POP	P,6
+	POP	P,5
+	RET
+
+EDSIGN:	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	MOVEM	T1,SIGP
+	MOVEM	T2,KEYP
+	MOVEM	T3,MSGP
+	MOVEM	T4,MSGL
+	MOVE	T1,KEYP		;a, prefix
+	CALL	HSECRT
+	MOVEI	T1,SHACTX	;r = SHA-512(prefix || M) mod L
+	CALL	S512I
+	MOVEI	T1,SHACTX
+	MOVEI	T2,HASH+^D32
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVE	T2,MSGP
+	MOVE	T3,MSGL
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVEI	T2,HASH
+	CALL	S512F
+	MOVEI	T1,RS
+	MOVEI	T2,HASH
+	CALL	SCRED
+	MOVEI	SCP,RS		;R = r * B, into sig[0..31]
+	CALL	SMULB
+	MOVE	T1,SIGP
+	CALL	ENCODE
+	MOVEI	T1,SHACTX	;k = SHA-512(R || A || M) mod L
+	CALL	S512I
+	MOVEI	T1,SHACTX
+	MOVE	T2,SIGP
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVE	T2,KEYP
+	ADDI	T2,^D32
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVE	T2,MSGP
+	MOVE	T3,MSGL
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVEI	T2,HASH
+	CALL	S512F
+	MOVEI	T1,KS
+	MOVEI	T2,HASH
+	CALL	SCRED
+	MOVE	T1,SIGP		;S = (k * a + r) mod L, into sig[32..63]
+	ADDI	T1,^D32
+	MOVEI	T2,KS
+	MOVEI	T3,AS
+	MOVEI	T4,RS
+	CALL	SCMULA
+	POP	P,7
+	POP	P,6
+	POP	P,5
+	RET
+
+SUBTTL	EDVRFY
+
+;EDVRFY - T1/ sig (64)  T2/ public key (32)  T3/ message  T4/ length.
+;Skip return if sig is a valid signature (RFC 8032 5.1.7, without the
+;cofactor): S < L, A decodes, and encode(S*B - k*A) = R, with
+;k = SHA-512(R || A || M) mod L.
+
+EDVRFY:	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	MOVEM	T1,SIGP
+	MOVEM	T2,KEYP
+	MOVEM	T3,MSGP
+	MOVEM	T4,MSGL
+	MOVEI	T4,^D31		;S < L?  (compare from the top byte)
+EDV1:	MOVE	T1,SIGP
+	ADD	T1,T4
+	MOVE	T2,^D32(T1)
+	CAMGE	T2,EDLBY(T4)
+	 JRST	EDV2		;Less: fine
+	CAME	T2,EDLBY(T4)
+	 JRST	EDVBAD		;Greater
+	SOJGE	T4,EDV1
+	JRST	EDVBAD		;Equal
+
+EDV2:	MOVEI	T1,VY		;Decode A: y
+	MOVE	T2,KEYP
+	CALL	FFRBYT
+	F2	FSQ,VU,VY	;u = y^2 - 1
+	MOVEI	T1,VT
+	CALL	FONE
+	F3	FSUB,VU,VU,VT
+	F2	FFRBYT,VW,EDDBY	;v = d y^2 + 1
+	F2	FSQ,VV,VY
+	F3	FMUL,VV,VV,VW
+	F3	FADD,VV,VV,VT
+	F2	FSQ,VW,VV	;VW = v^3
+	F3	FMUL,VW,VW,VV
+	F2	FSQ,VX,VW	;VX = u v^7
+	F3	FMUL,VX,VX,VV
+	F3	FMUL,VX,VX,VU
+	MOVEI	T1,VR
+	CALL	FONE		;VR = VX^(2^252-3): all bits set but bit 1
+	MOVEI	TBIT,^D251
+EDV3:	F2	FSQ,VR,VR
+	CAIE	TBIT,1
+	 CALL	EDVMR
+	SOJGE	TBIT,EDV3
+	F3	FMUL,VX,VU,VW	;x = u v^3 (u v^7)^((p-5)/8)
+	F3	FMUL,VX,VX,VR
+	F2	FSQ,VT,VX	;v x^2 = u?
+	F3	FMUL,VT,VT,VV
+	F2	FTOBYT,VBYT,VT
+	F2	FTOBYT,VBYT2,VU
+	CALL	EDVCMP
+	 SKIPA
+	JRST	EDV4		;Yes: x is right
+	F2	FNEG,VW,VU	;v x^2 = -u?
+	F2	FTOBYT,VBYT2,VW
+	CALL	EDVCMP
+	 JRST	EDVBAD		;Neither: not a point
+	F2	FFRBYT,VW,EDIBY	;x = x sqrt(-1)
+	F3	FMUL,VX,VX,VW
+EDV4:	F2	FTOBYT,VBYT,VX	;Sign: we want -A, so make the parity of
+	MOVE	T1,VBYT		; x differ from the sign bit of A
+	ANDI	T1,1
+	MOVE	T2,KEYP
+	MOVE	T2,^D31(T2)
+	LSH	T2,-7
+	CAMN	T1,T2
+	 CALL	EDVNEG
+	MOVSI	T1,VX		;-A = (-x, y, 1, -x y)
+	HRRI	T1,VA+PX
+	BLT	T1,VA+PX+11
+	MOVSI	T1,VY
+	HRRI	T1,VA+PY
+	BLT	T1,VA+PY+11
+	MOVEI	T1,VA+PZ
+	CALL	FONE
+	F3	FMUL,VA+PT,VX,VY
+
+	MOVEI	T1,SHACTX	;k = SHA-512(R || A || M) mod L
+	CALL	S512I
+	MOVEI	T1,SHACTX
+	MOVE	T2,SIGP
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVE	T2,KEYP
+	MOVEI	T3,^D32
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVE	T2,MSGP
+	MOVE	T3,MSGL
+	CALL	S512U
+	MOVEI	T1,SHACTX
+	MOVEI	T2,HASH
+	CALL	S512F
+	MOVEI	T1,KS
+	MOVEI	T2,HASH
+	CALL	SCRED
+
+	MOVE	SCP,SIGP	;VP = S B
+	ADDI	SCP,^D32
+	CALL	SMULB
+	MOVE	T1,[PQ,,VP]
+	BLT	T1,VP+PSIZE-1
+	MOVEI	T1,VA		;PQ = k (-A)
+	MOVEM	T1,BASEP
+	MOVEI	SCP,KS
+	CALL	SMULP
+	MOVEI	T1,PQ		;PQ = S B - k A
+	MOVEI	T2,PQ
+	MOVEI	T3,VP
+	CALL	PADD
+	MOVEI	T1,VBYT		;encode = R?
+	CALL	ENCODE
+	MOVSI	T4,-^D32
+	MOVE	T1,SIGP
+EDV5:	MOVE	T2,(T1)
+	CAME	T2,VBYT(T4)
+	 JRST	EDVBAD
+	ADDI	T1,1
+	AOBJN	T4,EDV5
+	AOS	-3(P)		;Valid: skip return
+EDVBAD:	POP	P,7
+	POP	P,6
+	POP	P,5
+	RET
+
+EDVMR:	F3	FMUL,VR,VR,VX	;VR = VR * VX
+	RET
+
+EDVNEG:	F2	FNEG,VX,VX
+	RET
+
+;EDVCMP - skip if VBYT = VBYT2 (32 bytes)
+
+EDVCMP:	MOVSI	T4,-^D32
+EDVCM1:	MOVE	T1,VBYT(T4)
+	CAME	T1,VBYT2(T4)
+	 RET
+	AOBJN	T4,EDVCM1
+	AOS	(P)
+	RET
+
+;d = -121665/121666 mod p, 32 bytes little-endian
+EDDBY:
+	243
+	170
+	131
+	23
+	312
+	115
+	353
+	165
+	253
+	330
+	101
+	101
+	115
+	12
+	160
+	0
+	230
+	350
+	171
+	167
+	171
+	100
+	307
+	214
+	163
+	376
+	157
+	53
+	356
+	154
+	3
+	122
+;sqrt(-1) = 2^((p-1)/4) mod p
+EDIBY:
+	260
+	240
+	16
+	112
+	47
+	33
+	356
+	304
+	170
+	344
+	57
+	255
+	6
+	30
+	103
+	57
+	247
+	327
+	373
+	75
+	231
+	0
+	115
+	53
+	13
+	337
+	301
+	117
+	200
+	44
+	203
+	53
+;L = 2^252 + 27742317777372353535851937790883648493
+EDLBY:
+	355
+	323
+	365
+	134
+	32
+	143
+	22
+	130
+	326
+	234
+	367
+	242
+	336
+	371
+	336
+	24
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	0
+	20
+
+	LIT
+
+	END

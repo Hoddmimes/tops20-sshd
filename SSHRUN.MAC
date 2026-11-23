@@ -1,0 +1,145 @@
+	TITLE	SSHRUN - Start SSHD as the top fork of its own job
+
+;Why: TOPS-20's LOGIN% skips password checks for jobs on a PTY whose
+;owning job has WHEEL/OPERATOR enabled in its top fork.  Run under an
+;EXEC, SSHD3 either has no WHEEL (EXEC not enabled: can't ASND% PTY
+;lines) or the EXEC (top fork) has it enabled (no password checks).
+;So SSHD3 must be the top fork of its own job, with no EXEC above it.
+;
+;SSHRUN (run by a WHEEL with ENABLE) opens a PTY, creates a job logged
+;in as SSHD on it with CRJOB% running PS:<SSHD>SSHD.EXE as the top
+;fork (no EXEC), and relays that PTY to this terminal so the server's
+;messages can be seen.  ^C stops SSHRUN; the SSHD job is owned by this
+;job and goes away when this job logs out.
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	Q1=5			;PTY number
+	Q2=6			;Number of PTYs
+	Q3=7			;First PTY line
+	PTY=10			;PTY JFN
+	LINE=11			;TTY line of the PTY
+	JOB=12			;Created job number
+	P=17
+
+PDL:	BLOCK	40
+NAMBUF:	BLOCK	10		;"PTYnn:"
+CJBLK:	BLOCK	20		;CRJOB% argument block
+OBUF:	BLOCK	200		;PTY output (7-bit, packed)
+
+START:	RESET%
+	MOVE	P,[IOWD 40,PDL]
+	MOVEI	T1,.PTYPA	;Number of PTYs ,, first PTY line
+	GETAB%
+	 ERJMP	FATAL
+	HLRZ	Q2,T1
+	HRRZ	Q3,T1
+	SETZ	Q1,
+FIND:	CAML	Q1,Q2
+	 JRST	[TMSG <?No free PTY
+>
+		 HALTF%]
+	HRROI	T1,NAMBUF	;"PTYn:" (unit number in octal)
+	HRROI	T2,[ASCIZ /PTY/]
+	SETZ	T3,
+	SOUT%
+	MOVE	T2,Q1
+	MOVEI	T3,10
+	NOUT%
+	 JFCL
+	MOVEI	T2,":"
+	IDPB	T2,T1
+	SETZ	T2,
+	IDPB	T2,T1
+	MOVX	T1,GJ%SHT
+	HRROI	T2,NAMBUF
+	GTJFN%
+	 ERJMP	FIND2
+	MOVE	PTY,T1
+	MOVX	T2,FLD(7,OF%BSZ)!OF%RD!OF%WR
+	OPENF%
+	 ERJMP	FIND1
+	JRST	GOTPTY
+FIND1:	MOVE	T1,PTY
+	RLJFN%
+	 ERJMP	.+1
+FIND2:	AOJA	Q1,FIND
+
+GOTPTY:	MOVE	LINE,Q1
+	ADD	LINE,Q3
+	MOVEI	T1,.TTDES(LINE)	;Assign the TTY line (needs ENABLE)
+	ASND%
+	 ERJMP	FATAL
+	SETZM	CJBLK
+	MOVE	T1,[CJBLK,,CJBLK+1]
+	BLT	T1,CJBLK+17
+	HRROI	T1,[ASCIZ /SSHD/]
+	MOVEM	T1,CJBLK+.CJNAM
+	HRROI	T1,[ASCIZ //]	;No password: privileged creator
+	MOVEM	T1,CJBLK+.CJPSW
+	HRROI	T1,[ASCIZ /PS:<SSHD>SSHD.EXE/]
+	MOVEM	T1,CJBLK+.CJFIL
+	MOVEI	T1,.TTDES(LINE)
+	MOVEM	T1,CJBLK+.CJTTY
+	MOVX	T1,CJ%LOG!CJ%NAM!CJ%FIL!CJ%OWN!FLD(.CJUDA,CJ%ACT)
+	MOVEI	T2,CJBLK
+	CRJOB%
+	 ERJMP	FATAL
+	MOVE	JOB,T1
+	TMSG	<[SSHD started as job >
+	MOVE	T2,JOB
+	MOVEI	T1,.PRIOU
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	TMSG	< (user SSHD, top fork, no EXEC); ^C to stop watching]
+>
+RELAY:	CALL	DRAIN		;Show the server's output
+	MOVEI	T1,^D200
+	DISMS%
+	JRST	RELAY
+
+;DRAIN - print everything the job has output so far
+
+DRAIN:	MOVEI	T1,.TTDES(LINE)
+	SOBE%			;Skip if empty, else T2 = count
+	 SKIPA
+	  RET
+	CAILE	T2,^D500
+	 MOVEI	T2,^D500
+	MOVN	T3,T2
+	MOVE	T1,PTY
+	MOVE	T2,[POINT 7,OBUF]
+	SIN%
+	 ERJMP	R
+	SETZ	T1,
+	IDPB	T1,T2
+	MOVE	T2,[POINT 7,OBUF]
+DRAIN1:	ILDB	T1,T2
+	JUMPE	T1,DRAIN
+	ANDI	T1,177
+	PBOUT%
+	JRST	DRAIN1
+
+FATAL:	TMSG	<?>
+	MOVEI	T1,.PRIOU
+	HRLOI	T2,.FHSLF
+	SETZ	T3,
+	ERSTR%
+	 JFCL
+	 JFCL
+	TMSG	<
+>
+	HALTF%
+	JRST	START
+
+R:	RET
+
+	LIT
+
+	END	START

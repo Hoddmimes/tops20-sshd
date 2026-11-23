@@ -1,0 +1,66 @@
+	UNIVERSAL SSHDEF - Definitions for the TOPS-20 SSH server
+
+;Searched by every SSHD module.  After changing this file:
+;COMPILE SSHDEF, then reassemble all modules (LOAD /COMPILE ...).
+
+	SEARCH	MONSYM,MACSYM
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	Q1=5
+	Q2=6
+	Q3=7
+	IX=10
+	P=17
+
+PDLEN==200
+MAXPKT==^D35000			;Largest packet_length accepted
+OMAX==^D4096			;Largest packet we build
+SHASZ==^D80			;SHA-256 context size (S256SZ = 74)
+
+;SSH message numbers
+
+SSHDIS==1			;DISCONNECT
+SSHIGN==2			;IGNORE
+SSHUNI==3			;UNIMPLEMENTED
+SSHEXT==7			;EXT_INFO (RFC 8308)
+SSHDBG==4			;DEBUG
+SSHSRQ==5			;SERVICE_REQUEST
+SSHSAC==6			;SERVICE_ACCEPT
+SSHKEX==^D20			;KEXINIT
+SSHNEW==^D21			;NEWKEYS
+SSHECI==^D30			;KEX_ECDH_INIT
+SSHECR==^D31			;KEX_ECDH_REPLY
+SSHUAR==^D50			;USERAUTH_REQUEST
+SSHUAF==^D51			;USERAUTH_FAILURE
+SSHUAS==^D52			;USERAUTH_SUCCESS
+SSHPKO==^D60			;USERAUTH_PK_OK
+SDMAX==^D2000			;Largest signed data (publickey request)
+SSHGRQ==^D80			;GLOBAL_REQUEST
+SSHRQF==^D82			;REQUEST_FAILURE
+SSHCOP==^D90			;CHANNEL_OPEN
+SSHCOC==^D91			;CHANNEL_OPEN_CONFIRMATION
+SSHCOF==^D92			;CHANNEL_OPEN_FAILURE
+SSHCWA==^D93			;CHANNEL_WINDOW_ADJUST
+SSHCDA==^D94			;CHANNEL_DATA
+SSHCXD==^D95			;CHANNEL_EXTENDED_DATA
+SSHCEF==^D96			;CHANNEL_EOF
+SSHCCL==^D97			;CHANNEL_CLOSE
+SSHCRQ==^D98			;CHANNEL_REQUEST
+SSHCSU==^D99			;CHANNEL_SUCCESS
+SSHCFA==^D100			;CHANNEL_FAILURE
+
+RSIZE==^D4096			;Network ring buffer size (power of 2)
+RMASK==RSIZE-1
+LWINI==^D32768			;Our channel window (8 KB was tried against the
+				; network stalls: much slower, no better)
+LMAXP==^D32768			;Largest channel packet we accept
+FTSCP==0			;1: classic scp (module SSHSCP; add it to the
+				; LOAD in tools/build.py).  0: no scp.
+SMAX==^D16			;Most concurrent sessions (MAX-SESSIONS limit)
+PCHUNK==^D1024			;Largest PTY output chunk we send
+
+
+	END

@@ -1,0 +1,154 @@
+	TITLE	SSHDAT - TOPS-20 SSH server: data areas
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	INTERN	NSESS,SESFH,SESNO,NEWFH,FACS,MFULL,ISSESS,SPFH
+	INTERN	EXENAM,SACS,RNDB
+	INTERN	LGDEAD,LGTMO,SESNUM,DRAIN,SPSTA,CTLSTP,CTLRST,CTLSTA
+	INTERN	ALGCMP,ALGENC,ALGHK,ALGKEX,ALGKX1,ALGKX2,ALGMAC,AUTHF
+	INTERN	B1,BASE9,CHOPEN,CJBLK,CLOSED,ESK,FPB,HAVSID
+	INTERN	HCTX,HH,HKEY,HPK,HSK,IC,ICLEN,IS
+	INTERN	ISLEN,JOB,KEYFIL,KEYRX,KEYTX,KMP,KMPL,KSB
+	INTERN	KSBL,KSEC,LENC,LINE,LWIN,MYVER,NBUF,NET
+	INTERN	NETEOF,OBUF,OLEN,PAY,PCNT,PDAT,PDL,PK64
+	INTERN	PKT,PLEN,POOL,PTYBUF,PTYJ,PTYNAM,PWA,PWL
+	INTERN	QCB,QSB,RCHAN,RCTR,RCTX,RDRFH,RING,RINGR
+	INTERN	RINGW,RIX,RMAXP,RPDL,RQW,RTMP,RWIN,RXENC
+	INTERN	SEQI,SEQO,SHELL,SID,SIG,STH,STM,TAG
+	INTERN	TXENC,U4,UNAM,UPSW,VC,VCLEN,VS,VSLEN
+	INTERN	WORK
+
+SUBTTL	Data
+
+PDL:	BLOCK	PDLEN
+NET:	BLOCK	1		;TCP JFN
+SEQI:	BLOCK	1		;Receive sequence number
+SEQO:	BLOCK	1		;Send sequence number
+RXENC:	BLOCK	1		;Nonzero: receive side encrypted
+TXENC:	BLOCK	1		;Nonzero: send side encrypted
+HAVSID:	BLOCK	1		;Nonzero: session id set
+
+;Byte arrays (one byte per word)
+
+VC:	BLOCK	^D256		;Client identification string
+VCLEN:	BLOCK	1
+VS:	BLOCK	^D64		;Server identification string
+VSLEN:	BLOCK	1
+IC:	BLOCK	OMAX		;Client KEXINIT payload
+ICLEN:	BLOCK	1
+IS:	BLOCK	OMAX		;Server KEXINIT payload
+ISLEN:	BLOCK	1
+PKT:	BLOCK	MAXPKT+^D64	;Raw packet
+PAY:	BLOCK	MAXPKT		;Received payload
+PLEN:	BLOCK	1
+RIX:	BLOCK	1		;Read index into PAY
+OBUF:	BLOCK	OMAX		;Payload being built
+OLEN:	BLOCK	1
+NBUF:	BLOCK	<MAXPKT+^D64>/4+1 ;8-bit packed network buffer
+
+;Phase 5 data
+
+RING:	BLOCK	RSIZE		;Bytes from the network (reader fork)
+RINGW:	BLOCK	1		;Bytes written (reader fork)
+RINGR:	BLOCK	1		;Bytes read (main fork)
+NETEOF:	BLOCK	1		;Set by the reader fork at end of stream
+RDRFH:	BLOCK	1		;Reader fork handle
+RPDL:	BLOCK	40		;Reader fork stack
+UNAM:	BLOCK	10		;User name, ASCIZ
+UPSW:	BLOCK	10		;Password, ASCIZ (cleared after use)
+PWA:	BLOCK	1		;Password location in PAY
+PWL:	BLOCK	1		; and length
+AUTHF:	BLOCK	1		;Failed attempts
+JOB:	BLOCK	1		;Job created for the user (0 = none)
+PTYJ:	BLOCK	1		;PTY JFN (0 = none)
+LINE:	BLOCK	1		;TTY line of the PTY
+PTYNAM:	BLOCK	4		;"PTYnn:"
+CJBLK:	BLOCK	20		;CRJOB% argument block
+CHOPEN:	BLOCK	1		;Session channel open
+RCHAN:	BLOCK	1		;Client's channel number
+RWIN:	BLOCK	1		;Client's window (bytes we may send)
+RMAXP:	BLOCK	1		;Client's maximum packet
+LWIN:	BLOCK	1		;Our window (bytes the client may send)
+SHELL:	BLOCK	1		;Shell started
+CLOSED:	BLOCK	1		;We have sent CHANNEL_CLOSE
+WORK:	BLOCK	1		;Main loop did something
+RQW:	BLOCK	1		;want_reply of the current request
+PCNT:	BLOCK	1		;PTY chunk length
+PTYBUF:	BLOCK	PCHUNK/5+2	;7-bit PTY input
+PDAT:	BLOCK	PCHUNK		;PTY data, one byte per word
+
+HSK:	BLOCK	^D32		;Host key: secret || public (HKEY)
+HPK:	BLOCK	^D32
+HKEY==HSK
+KSB:	BLOCK	^D64		;Host key blob K_S
+KSBL:	BLOCK	1
+QCB:	BLOCK	^D32		;Client ephemeral public key
+QSB:	BLOCK	^D32		;Server ephemeral public key
+ESK:	BLOCK	^D32		;Server ephemeral secret
+KSEC:	BLOCK	^D32		;Shared secret K (X25519 output)
+KMP:	BLOCK	^D40		;K as mpint body
+KMPL:	BLOCK	1
+HH:	BLOCK	^D32		;Exchange hash H
+SID:	BLOCK	^D32		;Session id
+SIG:	BLOCK	^D64		;Signature of H
+KEYTX:	BLOCK	^D64		;Server to client key (K2 || K1)
+KEYRX:	BLOCK	^D64		;Client to server key
+STM:	BLOCK	^D16		;ChaCha20 state, main key
+STH:	BLOCK	^D16		;ChaCha20 state, header key
+PK64:	BLOCK	^D64		;Poly1305 key block
+TAG:	BLOCK	^D16
+LENC:	BLOCK	4		;Decrypted length bytes
+HCTX:	BLOCK	SHASZ		;SHA-256 contexts
+RCTX:	BLOCK	SHASZ
+U4:	BLOCK	4		;uint32 scratch bytes
+B1:	BLOCK	1		;single byte scratch
+POOL:	BLOCK	^D32		;Random pool
+RCTR:	BLOCK	1		;Random counter
+RTMP:	BLOCK	^D32
+BASE9:	^D9			;u = 9, the X25519 base point
+	BLOCK	^D31
+HEXB:	BLOCK	^D70		;Host key file text
+FPB:	BLOCK	^D32		;Fingerprint hash
+
+MYVER:	ASCIZ	/SSH-2.0-TOPS20_SSHD3/
+CRLF:	BYTE	(7) 15,12,0
+KEYFIL:	ASCIZ	/SSHD-HOST-KEY.TXT/
+
+;Our algorithm choices.  The KEX list also has the libssh alias.
+
+ALGKEX:	ASCIZ	/curve25519-sha256,curve25519-sha256@libssh.org/
+ALGKX1:	ASCIZ	/curve25519-sha256/
+ALGKX2:	ASCIZ	/curve25519-sha256@libssh.org/
+ALGHK:	ASCIZ	/ssh-ed25519/
+ALGENC:	ASCIZ	/chacha20-poly1305@openssh.com/
+ALGMAC:	ASCIZ	/hmac-sha2-256/
+ALGCMP:	ASCIZ	/none/
+SVCUA:	ASCIZ	/ssh-userauth/
+
+
+;Concurrent sessions (main fork)
+
+NSESS:	BLOCK	1		;Active session forks
+SESFH:	BLOCK	SMAX		;Their fork handles (0 = free slot)
+SESNO:	BLOCK	1		;Number of the latest session
+NEWFH:	BLOCK	1		;Listener fork being waited for
+SPFH:	BLOCK	1		;Fork being created (SPAWN)
+FACS:	BLOCK	20		;Its ACs (RFACS%)
+MFULL:	BLOCK	1		;"All sessions in use" said
+ISSESS:	BLOCK	1		;Nonzero in a session fork
+EXENAM:	BLOCK	^D20		;Our SSHD.EXE, full name
+SACS:	BLOCK	20		;ACs given to a session fork
+RNDB:	BLOCK	^D40		;Random bytes for it
+SESNUM:	BLOCK	SMAX		;Session numbers of the forks in SESFH
+SPSTA:	BLOCK	1		;Start address for SPAWN
+DRAIN:	BLOCK	1		;Stopping: 1 stop, 2 restart
+CTLSTP:	BLOCK	^D20		;Control files: PS:<user>SSHD.STOP
+CTLRST:	BLOCK	^D20		; SSHD.RESTART
+CTLSTA:	BLOCK	^D20		; SSHD.STATUS
+LGDEAD:	BLOCK	1		;Session: login deadline (TIME% ms), 0 = none
+LGTMO:	BLOCK	1		;Session: the login deadline passed
+
+	LIT
+
+	END

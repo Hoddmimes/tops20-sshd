@@ -1,0 +1,383 @@
+	TITLE	POLY - Poly1305 one-time authenticator for TOPS-20
+
+;Poly1305 (RFC 8439 2.5), modelled on poly1305-donna's 32-bit code:
+;the accumulator h and the key r are 5 limbs of 26 bits.  Products
+;are formed with MUL (exact 70-bit result) and summed with DADD, then
+;split into limb and carry with ASHC.
+;
+;Call (clobbers T1-T4 only):
+;  T1/ key (32 bytes)  T2/ message  T3/ length  T4/ tag (16 bytes)
+;                                                   CALL P1305
+;Bytes are one per word.
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	P1305
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	DH=5			;Double-word accumulator (DH,DL)
+	DL=6
+	PH=7			;Product pair from MUL (PH,PL)
+	PL=10
+	MSG=11			;Message address
+	CNT=12			;Bytes left
+	I=13
+	OUTP=14			;Tag address
+	P=17
+
+M32:	37777777777
+M26:	377777777		;2^26-1
+KEYP:	BLOCK	1
+R0:	BLOCK	1
+R1:	BLOCK	1
+R2:	BLOCK	1
+R3:	BLOCK	1
+R4:	BLOCK	1
+S1:	BLOCK	1		;5*R1 .. 5*R4
+S2:	BLOCK	1
+S3:	BLOCK	1
+S4:	BLOCK	1
+H0:	BLOCK	1		;Accumulator
+H1:	BLOCK	1
+H2:	BLOCK	1
+H3:	BLOCK	1
+H4:	BLOCK	1
+G0:	BLOCK	1		;h - p candidate
+G1:	BLOCK	1
+G2:	BLOCK	1
+G3:	BLOCK	1
+G4:	BLOCK	1
+D0:	BLOCK	2		;Double-word products d0..d4
+D1:	BLOCK	2
+D2:	BLOCK	2
+D3:	BLOCK	2
+D4:	BLOCK	2
+BLK:	BLOCK	^D17		;16 message bytes + the 2^128 bit
+
+DEFINE	SAVREG,<
+	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,10
+	PUSH	P,11
+	PUSH	P,12
+	PUSH	P,13
+	PUSH	P,14
+>
+DEFINE	RSTREG,<
+	POP	P,14
+	POP	P,13
+	POP	P,12
+	POP	P,11
+	POP	P,10
+	POP	P,7
+	POP	P,6
+	POP	P,5
+>
+
+;LE32 R,ADR - R := little-endian 32-bit value of the 4 bytes at ADR.
+
+DEFINE	LE32(R,ADR),<
+	MOVE	R,3+ADR
+	LSH	R,^D8
+	IOR	R,2+ADR
+	LSH	R,^D8
+	IOR	R,1+ADR
+	LSH	R,^D8
+	IOR	R,0+ADR
+>
+
+;MA X,Y - (DH,DL) += X*Y
+
+DEFINE	MA(X,Y),<
+	MOVE	PH,X
+	MUL	PH,Y
+	DADD	DH,PH
+>
+
+;STEP SRC,DST - (DH,DL) := SRC + T2; DST := low 26 bits; T2 := carry
+
+DEFINE	STEP(SRC,DST),<
+	DMOVE	DH,SRC
+	ADD	DL,T2
+	TLZE	DL,400000	;Carry into the high word?
+	 ADDI	DH,1
+	MOVE	T1,DL
+	AND	T1,M26
+	MOVEM	T1,DST
+	ASHC	DH,-^D26
+	MOVE	T2,DL
+>
+
+SUBTTL	P1305
+
+P1305:	SAVREG
+	MOVEM	T1,KEYP
+	MOVE	MSG,T2
+	MOVE	CNT,T3
+	MOVE	OUTP,T4
+	MOVE	T4,KEYP		;r := clamp(key[0..15])
+	LE32	T1,0(T4)
+	AND	T1,M26
+	MOVEM	T1,R0
+	LE32	T1,3(T4)
+	LSH	T1,-2
+	AND	T1,[377777403]
+	MOVEM	T1,R1
+	IMULI	T1,5
+	MOVEM	T1,S1
+	LE32	T1,6(T4)
+	LSH	T1,-4
+	AND	T1,[377740377]
+	MOVEM	T1,R2
+	IMULI	T1,5
+	MOVEM	T1,S2
+	LE32	T1,11(T4)
+	LSH	T1,-6
+	AND	T1,[374037777]
+	MOVEM	T1,R3
+	IMULI	T1,5
+	MOVEM	T1,S3
+	LE32	T1,14(T4)
+	LSH	T1,-^D8
+	AND	T1,[3777777]
+	MOVEM	T1,R4
+	IMULI	T1,5
+	MOVEM	T1,S4
+	SETZM	H0
+	SETZM	H1
+	SETZM	H2
+	SETZM	H3
+	SETZM	H4
+
+;Process 16-byte blocks; the last one may be short.
+
+PBLK:	JUMPLE	CNT,PFIN
+	SETZ	I,
+	CAIGE	CNT,^D16	;Full block?
+	 JRST	PBLK2		;No
+PBLK1:	MOVE	T1,(MSG)	;Copy 16 bytes
+	MOVEM	T1,BLK(I)
+	ADDI	MSG,1
+	CAIGE	I,^D15
+	 AOJA	I,PBLK1
+	MOVEI	T1,1		;Full block: 2^128 bit set
+	MOVEM	T1,BLK+^D16
+	SUBI	CNT,^D16
+	JRST	PBLK4
+PBLK2:	MOVE	T1,(MSG)	;Short block: copy CNT bytes
+	MOVEM	T1,BLK(I)
+	ADDI	MSG,1
+	ADDI	I,1
+	CAMGE	I,CNT
+	 JRST	PBLK2
+	MOVEI	T1,1		;Then a 1 byte and zeros
+	MOVEM	T1,BLK(I)
+PBLK3:	CAIL	I,^D16
+	 JRST	PBLK5
+	ADDI	I,1
+	SETZM	BLK(I)
+	JRST	PBLK3
+PBLK5:	SETZB	CNT,BLK+^D16	;No 2^128 bit
+PBLK4:	CALL	PBLOCK
+	JRST	PBLK
+
+;PBLOCK - h := (h + block) * r  mod 2^130-5   (partially reduced)
+
+PBLOCK:	LE32	T1,BLK		;h += block
+	AND	T1,M26
+	ADDM	T1,H0
+	LE32	T1,BLK+3
+	LSH	T1,-2
+	AND	T1,M26
+	ADDM	T1,H1
+	LE32	T1,BLK+6
+	LSH	T1,-4
+	AND	T1,M26
+	ADDM	T1,H2
+	LE32	T1,BLK+^D9
+	LSH	T1,-6
+	AND	T1,M26
+	ADDM	T1,H3
+	LE32	T1,BLK+^D12
+	LSH	T1,-^D8
+	MOVE	T2,BLK+^D16
+	LSH	T2,^D24
+	IOR	T1,T2
+	ADDM	T1,H4
+	SETZB	DH,DL		;d0 = h0r0 + h1s4 + h2s3 + h3s2 + h4s1
+	MA	H0,R0
+	MA	H1,S4
+	MA	H2,S3
+	MA	H3,S2
+	MA	H4,S1
+	DMOVEM	DH,D0
+	SETZB	DH,DL		;d1 = h0r1 + h1r0 + h2s4 + h3s3 + h4s2
+	MA	H0,R1
+	MA	H1,R0
+	MA	H2,S4
+	MA	H3,S3
+	MA	H4,S2
+	DMOVEM	DH,D1
+	SETZB	DH,DL		;d2 = h0r2 + h1r1 + h2r0 + h3s4 + h4s3
+	MA	H0,R2
+	MA	H1,R1
+	MA	H2,R0
+	MA	H3,S4
+	MA	H4,S3
+	DMOVEM	DH,D2
+	SETZB	DH,DL		;d3 = h0r3 + h1r2 + h2r1 + h3r0 + h4s4
+	MA	H0,R3
+	MA	H1,R2
+	MA	H2,R1
+	MA	H3,R0
+	MA	H4,S4
+	DMOVEM	DH,D3
+	SETZB	DH,DL		;d4 = h0r4 + h1r3 + h2r2 + h3r1 + h4r0
+	MA	H0,R4
+	MA	H1,R3
+	MA	H2,R2
+	MA	H3,R1
+	MA	H4,R0
+	DMOVEM	DH,D4
+	SETZ	T2,		;Carry chain
+	STEP	D0,H0
+	STEP	D1,H1
+	STEP	D2,H2
+	STEP	D3,H3
+	STEP	D4,H4
+	IMULI	T2,5		;h0 += 5 * carry
+	ADD	T2,H0
+	MOVE	T1,T2
+	AND	T1,M26
+	MOVEM	T1,H0
+	LSH	T2,-^D26
+	ADDM	T2,H1
+	RET
+
+;Finish: fully reduce h, add s, store the tag.
+
+PFIN:	MOVE	T2,H1		;Full carry h1 -> h2 -> h3 -> h4 -> h0 -> h1
+	LSH	T2,-^D26
+	MOVE	T1,M26
+	ANDM	T1,H1
+	ADDB	T2,H2
+	LSH	T2,-^D26
+	ANDM	T1,H2
+	ADDB	T2,H3
+	LSH	T2,-^D26
+	ANDM	T1,H3
+	ADDB	T2,H4
+	LSH	T2,-^D26
+	ANDM	T1,H4
+	IMULI	T2,5
+	ADDB	T2,H0
+	LSH	T2,-^D26
+	ANDM	T1,H0
+	ADDM	T2,H1
+	MOVE	T2,H0		;g := h + 5 - 2^130
+	ADDI	T2,5
+	MOVE	T3,T2
+	AND	T3,T1
+	MOVEM	T3,G0
+	LSH	T2,-^D26
+	ADD	T2,H1
+	MOVE	T3,T2
+	AND	T3,T1
+	MOVEM	T3,G1
+	LSH	T2,-^D26
+	ADD	T2,H2
+	MOVE	T3,T2
+	AND	T3,T1
+	MOVEM	T3,G2
+	LSH	T2,-^D26
+	ADD	T2,H3
+	MOVE	T3,T2
+	AND	T3,T1
+	MOVEM	T3,G3
+	LSH	T2,-^D26
+	ADD	T2,H4
+	SUB	T2,[400000000]	;- 2^26 in limb 4 = - 2^130
+	JUMPL	T2,PFIN1	;Negative: h < p, keep h
+	MOVEM	T2,H4		;h >= p: use g
+	MOVE	T1,G0
+	MOVEM	T1,H0
+	MOVE	T1,G1
+	MOVEM	T1,H1
+	MOVE	T1,G2
+	MOVEM	T1,H2
+	MOVE	T1,G3
+	MOVEM	T1,H3
+PFIN1:	MOVE	T1,H1		;Repack into four 32-bit words in
+	LSH	T1,^D26		; DH, DL, PH, PL
+	IOR	T1,H0
+	AND	T1,M32
+	MOVE	DH,T1
+	MOVE	T1,H1
+	LSH	T1,-6
+	MOVE	T2,H2
+	LSH	T2,^D20
+	IOR	T1,T2
+	AND	T1,M32
+	MOVE	DL,T1
+	MOVE	T1,H2
+	LSH	T1,-^D12
+	MOVE	T2,H3
+	LSH	T2,^D14
+	IOR	T1,T2
+	AND	T1,M32
+	MOVE	PH,T1
+	MOVE	T1,H3
+	LSH	T1,-^D18
+	MOVE	T2,H4
+	LSH	T2,^D8
+	IOR	T1,T2
+	AND	T1,M32
+	MOVE	PL,T1
+	MOVE	T4,KEYP		;tag := (h + s) mod 2^128
+	LE32	T1,^D16(T4)
+	ADD	DH,T1
+	LE32	T1,^D20(T4)
+	ADD	DL,T1
+	LE32	T1,^D24(T4)
+	ADD	PH,T1
+	LE32	T1,^D28(T4)
+	ADD	PL,T1
+	MOVE	T1,DH		;Propagate carries between the words
+	LSH	T1,-^D32
+	ADD	DL,T1
+	MOVE	T1,DL
+	LSH	T1,-^D32
+	ADD	PH,T1
+	MOVE	T1,PH
+	LSH	T1,-^D32
+	ADD	PL,T1
+	MOVE	T1,DH		;Store 16 bytes little-endian
+	CALL	PUT4
+	MOVE	T1,DL
+	CALL	PUT4
+	MOVE	T1,PH
+	CALL	PUT4
+	MOVE	T1,PL
+	CALL	PUT4
+	RSTREG
+	RET
+
+;PUT4 - store the low 32 bits of T1 as 4 bytes LE at OUTP, advance OUTP.
+
+PUT4:	MOVEI	T3,4
+PUT41:	MOVE	T2,T1
+	ANDI	T2,377
+	MOVEM	T2,(OUTP)
+	ADDI	OUTP,1
+	LSH	T1,-^D8
+	SOJG	T3,PUT41
+	RET
+
+	LIT
+
+	END

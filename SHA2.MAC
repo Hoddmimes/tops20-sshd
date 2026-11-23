@@ -1,0 +1,615 @@
+	TITLE	SHA2 - SHA-256 and SHA-512 for TOPS-20
+
+;FIPS 180-4 SHA-256 and SHA-512.
+;
+;Data representation: messages and digests are arrays of 8-bit bytes
+;stored one byte per word (right-justified), which is how the SSH
+;code keeps packet data.
+;
+;32-bit quantities live right-justified in a 36-bit word and are
+;masked with M32 after additions and left shifts.  A 64-bit quantity
+;(SHA-512) is a pair of words, high 32 bits first.
+;
+;Calls (all clobber T1-T4 only, everything else is preserved):
+;
+;  T1/ ctx                         CALL S256I   ;Initialise
+;  T1/ ctx  T2/ addr  T3/ count    CALL S256U   ;Hash count bytes
+;  T1/ ctx  T2/ addr               CALL S256F   ;Finish, 32 bytes to addr
+;
+;  S512I, S512U, S512F likewise, 64-byte digest.
+;
+;Context sizes: S256SZ and S512SZ words (also exported).
+;
+;The module keeps scratch data in its own storage, so it is not
+;reentrant (one fork at a time).
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	S256I,S256U,S256F,S512I,S512U,S512F
+	INTERN	S256SZ,S512SZ
+	EXTERN	K256,K512,H256I,H512I
+
+;Accumulators
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	P=17
+
+;Context layout, SHA-256
+
+S2.H==0				;8 words of hash state
+S2.CNT==10			;Total bytes hashed
+S2.BLN==11			;Bytes in S2.BUF
+S2.BUF==12			;64-byte block, one byte per word
+S256SZ==S2.BUF+^D64
+
+;Context layout, SHA-512
+
+S5.H==0				;16 words of hash state (8 pairs)
+S5.CNT==20			;Total bytes hashed
+S5.BLN==21			;Bytes in S5.BUF
+S5.BUF==22			;128-byte block, one byte per word
+S512SZ==S5.BUF+^D128
+
+;Scratch storage
+
+M32:	37777777777		;32-bit mask
+USRC:	BLOCK	1		;Update: source address
+UCNT:	BLOCK	1		;Update: bytes left
+UOUT:	BLOCK	1		;Final: output address
+FBITS:	BLOCK	1		;Final: message length in bits
+FCNT:	BLOCK	1		;Final: loop counter
+WARR:	BLOCK	^D64		;SHA-256 message schedule
+W512:	BLOCK	^D160		;SHA-512 message schedule (pairs)
+WV:	BLOCK	^D16		;SHA-512 working variables a..h (pairs)
+	WA=WV+0
+	WB=WV+2
+	WC=WV+4
+	WD=WV+6
+	WE=WV+10
+	WF=WV+12
+	WG=WV+14
+	WH=WV+16
+TT1:	BLOCK	2		;SHA-512 T1 temporary (pair)
+
+SUBTTL	Macros
+
+;Save and restore ACs 5-16 around a library call.
+
+DEFINE	SAVREG,<
+	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,10
+	PUSH	P,11
+	PUSH	P,12
+	PUSH	P,13
+	PUSH	P,14
+	PUSH	P,15
+	PUSH	P,16
+>
+DEFINE	RSTREG,<
+	POP	P,16
+	POP	P,15
+	POP	P,14
+	POP	P,13
+	POP	P,12
+	POP	P,11
+	POP	P,10
+	POP	P,7
+	POP	P,6
+	POP	P,5
+>
+
+;ADDST R,O - state word O(CTX) := (O(CTX) + R) mod 2^32
+
+DEFINE	ADDST(R,O),<
+	ADD	R,O(CTX)
+	AND	R,M32
+	MOVEM	R,O(CTX)
+>
+
+;ROTR32 D,S,N,TMP - D := S rotated right N bits (32-bit).  D, TMP ACs.
+
+DEFINE	ROTR32(D,S,N,TMP),<
+	MOVE	D,S
+	LSH	D,-<N>
+	MOVE	TMP,S
+	LSH	TMP,^D32-<N>
+	IOR	D,TMP
+	AND	D,M32
+>
+
+;ROTR64 DH,DL,SH,SL,N,TMP - (DH,DL) := (SH,SL) rotated right N bits.
+
+DEFINE	ROTR64(DH,DL,SH,SL,N,TMP),<
+IFL <N>-^D32,<
+	MOVE	DH,SH
+	LSH	DH,-<N>
+	MOVE	TMP,SL
+	LSH	TMP,^D32-<N>
+	IOR	DH,TMP
+	AND	DH,M32
+	MOVE	DL,SL
+	LSH	DL,-<N>
+	MOVE	TMP,SH
+	LSH	TMP,^D32-<N>
+	IOR	DL,TMP
+	AND	DL,M32
+>
+IFGE <N>-^D32,<
+	MOVE	DH,SL
+	LSH	DH,-<<N>-^D32>
+	MOVE	TMP,SH
+	LSH	TMP,^D64-<N>
+	IOR	DH,TMP
+	AND	DH,M32
+	MOVE	DL,SH
+	LSH	DL,-<<N>-^D32>
+	MOVE	TMP,SL
+	LSH	TMP,^D64-<N>
+	IOR	DL,TMP
+	AND	DL,M32
+>
+>
+
+;SHR64 DH,DL,SH,SL,N,TMP - (DH,DL) := (SH,SL) shifted right N<32 bits.
+
+DEFINE	SHR64(DH,DL,SH,SL,N,TMP),<
+	MOVE	DH,SH
+	LSH	DH,-<N>
+	MOVE	DL,SL
+	LSH	DL,-<N>
+	MOVE	TMP,SH
+	LSH	TMP,^D32-<N>
+	IOR	DL,TMP
+	AND	DL,M32
+>
+
+;NORM64 H,L,TMP - propagate carry from L into H, mask both to 32 bits.
+
+DEFINE	NORM64(H,L,TMP),<
+	MOVE	TMP,L
+	LSH	TMP,-^D32
+	ADD	H,TMP
+	AND	L,M32
+	AND	H,M32
+>
+
+;XOR64 - (AH,AL) := (AH,AL) xor (BH,BL), all ACs.
+
+DEFINE	XOR64(AH,AL,BH,BL),<
+	XOR	AH,BH
+	XOR	AL,BL
+>
+
+SUBTTL	SHA-256
+
+;ACs used inside the SHA-256 code
+
+	X=1
+	Y=2
+	Z=3
+	V=4
+	A=5
+	B=6
+	C=7
+	D=10
+	E=11
+	F=12
+	G=13
+	H=14
+	I=15
+	CTX=16
+
+;S256I - initialise context.  T1/ ctx
+
+S256I:	MOVSI	T2,-10
+	MOVE	T4,T1
+S256I1:	MOVE	T3,H256I(T2)
+	MOVEM	T3,S2.H(T4)
+	ADDI	T4,1
+	AOBJN	T2,S256I1
+	SETZM	S2.CNT(T1)
+	SETZM	S2.BLN(T1)
+	RET
+
+;S256U - hash bytes.  T1/ ctx, T2/ address, T3/ count
+
+S256U:	SAVREG
+	MOVE	CTX,T1
+	MOVEM	T2,USRC
+	MOVEM	T3,UCNT
+	ADDM	T3,S2.CNT(CTX)
+S256U1:	SOSGE	UCNT		;Any bytes left?
+	 JRST	S256U2		;No
+	MOVE	X,@USRC		;Next byte
+	ANDI	X,377
+	AOS	USRC
+	CALL	P256B		;Into the block, compress if full
+	JRST	S256U1
+S256U2:	RSTREG
+	RET
+
+;P256B - put byte X into the block, compress when it is full.
+;CTX/ ctx.  Clobbers ACs 1-15.
+
+P256B:	MOVE	Y,S2.BLN(CTX)
+	ADD	Y,CTX
+	MOVEM	X,S2.BUF(Y)
+	AOS	Y,S2.BLN(CTX)
+	CAIGE	Y,^D64		;Block full?
+	 RET			;No
+	CALL	C256		;Yes, compress it
+	SETZM	S2.BLN(CTX)
+	RET
+
+;S256F - finish.  T1/ ctx, T2/ output address (32 words)
+
+S256F:	SAVREG
+	MOVE	CTX,T1
+	MOVEM	T2,UOUT
+	MOVE	X,S2.CNT(CTX)	;Length in bits
+	LSH	X,3
+	MOVEM	X,FBITS
+	MOVEI	X,200		;Append the 1 bit
+	CALL	P256B
+S256F1:	MOVE	X,S2.BLN(CTX)	;Pad with zeros to 56 mod 64
+	CAIN	X,^D56
+	 JRST	S256F2
+	SETZ	X,
+	CALL	P256B
+	JRST	S256F1
+S256F2:	MOVNI	X,^D56		;Append 64-bit big-endian length
+	MOVEM	X,FCNT		;Shift count for the next byte
+S256F3:	MOVE	X,FBITS
+	MOVE	Y,FCNT
+	CAMGE	Y,[-^D36]	;Bytes above bit 36 are zero
+	 TDZA	X,X
+	LSH	X,(Y)
+	ANDI	X,377
+	CALL	P256B
+	MOVEI	X,^D8
+	ADDB	X,FCNT
+	JUMPLE	X,S256F3
+	MOVE	V,UOUT		;Store the digest, big-endian
+	MOVSI	I,-10
+	MOVE	A,CTX
+S256F4:	MOVE	X,S2.H(A)
+	MOVNI	Y,^D24
+S256F5:	MOVE	Z,X
+	LSH	Z,(Y)
+	ANDI	Z,377
+	MOVEM	Z,(V)
+	ADDI	V,1
+	ADDI	Y,^D8
+	JUMPLE	Y,S256F5
+	ADDI	A,1
+	AOBJN	I,S256F4
+	RSTREG
+	RET
+
+;C256 - compress the block in the context.  CTX/ ctx.
+;Clobbers ACs 1-15.
+
+C256:	MOVEI	X,S2.BUF(CTX)	;W[0..15] from the block
+	SETZ	I,
+C2561:	MOVE	Y,0(X)
+	LSH	Y,^D8
+	IOR	Y,1(X)
+	LSH	Y,^D8
+	IOR	Y,2(X)
+	LSH	Y,^D8
+	IOR	Y,3(X)
+	MOVEM	Y,WARR(I)
+	ADDI	X,4
+	CAIGE	I,^D15
+	 AOJA	I,C2561
+	MOVEI	I,^D16		;W[16..63]
+C2562:	MOVE	X,WARR-2(I)	;sigma1(W[t-2])
+	ROTR32	Y,X,^D17,Z
+	ROTR32	V,X,^D19,Z
+	XOR	Y,V
+	LSH	X,-^D10
+	XOR	Y,X
+	ADD	Y,WARR-7(I)	;+ W[t-7]
+	ADD	Y,WARR-^D16(I)	;+ W[t-16]
+	MOVE	X,WARR-^D15(I)	;sigma0(W[t-15])
+	ROTR32	Z,X,^D7,V
+	ROTR32	A,X,^D18,V
+	XOR	Z,A
+	LSH	X,-3
+	XOR	Z,X
+	ADD	Y,Z
+	AND	Y,M32
+	MOVEM	Y,WARR(I)
+	CAIGE	I,^D63
+	 AOJA	I,C2562
+	MOVE	A,0(CTX)	;Working variables from the state
+	MOVE	B,1(CTX)
+	MOVE	C,2(CTX)
+	MOVE	D,3(CTX)
+	MOVE	E,4(CTX)
+	MOVE	F,5(CTX)
+	MOVE	G,6(CTX)
+	MOVE	H,7(CTX)
+	SETZ	I,
+C2563:	ROTR32	X,E,^D6,Z	;Sigma1(e)
+	ROTR32	Y,E,^D11,Z
+	XOR	X,Y
+	ROTR32	Y,E,^D25,Z
+	XOR	X,Y
+	MOVE	Y,E		;Ch(e,f,g) = (e and f) xor (not e and g)
+	AND	Y,F
+	MOVE	Z,E
+	ANDCA	Z,G
+	XOR	Y,Z
+	ADD	X,Y		;T1 = h + Sigma1 + Ch + K[t] + W[t]
+	ADD	X,H
+	ADD	X,K256(I)
+	ADD	X,WARR(I)
+	ROTR32	Y,A,^D2,Z	;Sigma0(a)
+	ROTR32	V,A,^D13,Z
+	XOR	Y,V
+	ROTR32	V,A,^D22,Z
+	XOR	Y,V
+	MOVE	Z,B		;Maj(a,b,c) = (a and (b or c)) or (b and c)
+	IOR	Z,C
+	AND	Z,A
+	MOVE	V,B
+	AND	V,C
+	IOR	Z,V
+	ADD	Y,Z		;T2 = Sigma0 + Maj
+	MOVE	H,G
+	MOVE	G,F
+	MOVE	F,E
+	MOVE	E,D		;e = d + T1
+	ADD	E,X
+	AND	E,M32
+	MOVE	D,C
+	MOVE	C,B
+	MOVE	B,A
+	MOVE	A,X		;a = T1 + T2
+	ADD	A,Y
+	AND	A,M32
+	CAIGE	I,^D63
+	 AOJA	I,C2563
+	ADDST	A,0		;Add working variables into the state
+	ADDST	B,1
+	ADDST	C,2
+	ADDST	D,3
+	ADDST	E,4
+	ADDST	F,5
+	ADDST	G,6
+	ADDST	H,7
+	RET
+
+SUBTTL	SHA-512
+
+;ACs used inside the SHA-512 code (redefine the SHA-256 names)
+
+	PURGE	X,Y,Z,V,A,B,C,D,E,F,G,H
+	XH=1
+	XL=2
+	YH=3
+	YL=4
+	ZH=5
+	ZL=6
+	U=7
+	U2=10			;U,U2 form a pair for DMOVE
+
+;S512I - initialise context.  T1/ ctx
+
+S512I:	MOVSI	T2,-20
+	MOVE	T4,T1
+S512I1:	MOVE	T3,H512I(T2)
+	MOVEM	T3,S5.H(T4)
+	ADDI	T4,1
+	AOBJN	T2,S512I1
+	SETZM	S5.CNT(T1)
+	SETZM	S5.BLN(T1)
+	RET
+
+;S512U - hash bytes.  T1/ ctx, T2/ address, T3/ count
+
+S512U:	SAVREG
+	MOVE	CTX,T1
+	MOVEM	T2,USRC
+	MOVEM	T3,UCNT
+	ADDM	T3,S5.CNT(CTX)
+S512U1:	SOSGE	UCNT
+	 JRST	S512U2
+	MOVE	XH,@USRC
+	ANDI	XH,377
+	AOS	USRC
+	CALL	P512B
+	JRST	S512U1
+S512U2:	RSTREG
+	RET
+
+;P512B - put byte XH into the block, compress when it is full.
+
+P512B:	MOVE	XL,S5.BLN(CTX)
+	ADD	XL,CTX
+	MOVEM	XH,S5.BUF(XL)
+	AOS	XL,S5.BLN(CTX)
+	CAIGE	XL,^D128
+	 RET
+	CALL	C512
+	SETZM	S5.BLN(CTX)
+	RET
+
+;S512F - finish.  T1/ ctx, T2/ output address (64 words)
+
+S512F:	SAVREG
+	MOVE	CTX,T1
+	MOVEM	T2,UOUT
+	MOVE	XH,S5.CNT(CTX)
+	LSH	XH,3
+	MOVEM	XH,FBITS
+	MOVEI	XH,200
+	CALL	P512B
+S512F1:	MOVE	XH,S5.BLN(CTX)	;Pad with zeros to 112 mod 128
+	CAIN	XH,^D112
+	 JRST	S512F2
+	SETZ	XH,
+	CALL	P512B
+	JRST	S512F1
+S512F2:	MOVNI	XH,^D120	;128-bit big-endian length
+	MOVEM	XH,FCNT		;(top 8 bytes always zero here)
+S512F3:	MOVE	XH,FBITS
+	MOVE	XL,FCNT
+	CAMGE	XL,[-^D36]	;Bytes above bit 36 are zero
+	 TDZA	XH,XH
+	LSH	XH,(XL)
+	ANDI	XH,377
+	CALL	P512B
+	MOVEI	XH,^D8
+	ADDB	XH,FCNT
+	JUMPLE	XH,S512F3
+	MOVE	U,UOUT		;Store the digest
+	MOVSI	I,-20
+	MOVE	U2,CTX
+S512F4:	MOVE	XH,S5.H(U2)
+	MOVNI	XL,^D24
+S512F5:	MOVE	YH,XH
+	LSH	YH,(XL)
+	ANDI	YH,377
+	MOVEM	YH,(U)
+	ADDI	U,1
+	ADDI	XL,^D8
+	JUMPLE	XL,S512F5
+	ADDI	U2,1
+	AOBJN	I,S512F4
+	RSTREG
+	RET
+
+;C512 - compress the block in the context.  CTX/ ctx.
+;Clobbers ACs 1-15.
+
+C512:	MOVEI	XH,S5.BUF(CTX)	;W[0..15] from the block
+	SETZ	I,		;I = 2*t (word index into W512)
+C5121:	MOVE	YH,0(XH)
+	LSH	YH,^D8
+	IOR	YH,1(XH)
+	LSH	YH,^D8
+	IOR	YH,2(XH)
+	LSH	YH,^D8
+	IOR	YH,3(XH)
+	MOVEM	YH,W512(I)
+	ADDI	XH,4
+	CAIGE	I,^D31
+	 AOJA	I,C5121
+	MOVEI	I,^D32		;W[16..79]
+C5122:	ROTR64	YH,YL,W512-4(I),W512-3(I),^D19,U ;sigma1(W[t-2])
+	ROTR64	ZH,ZL,W512-4(I),W512-3(I),^D61,U
+	XOR64	YH,YL,ZH,ZL
+	SHR64	ZH,ZL,W512-4(I),W512-3(I),^D6,U
+	XOR64	YH,YL,ZH,ZL
+	ROTR64	ZH,ZL,W512-^D30(I),W512-^D29(I),^D1,U ;sigma0(W[t-15])
+	ROTR64	XH,XL,W512-^D30(I),W512-^D29(I),^D8,U
+	XOR64	ZH,ZL,XH,XL
+	SHR64	XH,XL,W512-^D30(I),W512-^D29(I),^D7,U
+	XOR64	ZH,ZL,XH,XL
+	ADD	YH,ZH
+	ADD	YL,ZL
+	ADD	YH,W512-^D14(I)	;+ W[t-7]
+	ADD	YL,W512-^D13(I)
+	ADD	YH,W512-^D32(I)	;+ W[t-16]
+	ADD	YL,W512-^D31(I)
+	NORM64	YH,YL,U
+	MOVEM	YH,W512(I)
+	MOVEM	YL,W512+1(I)
+	ADDI	I,2
+	CAIGE	I,^D160
+	 JRST	C5122
+	HRLZ	XH,CTX		;Working variables from the state
+	HRRI	XH,WV
+	BLT	XH,WV+17
+	SETZ	I,
+C5123:	ROTR64	YH,YL,WE,WE+1,^D14,U ;Sigma1(e)
+	ROTR64	ZH,ZL,WE,WE+1,^D18,U
+	XOR64	YH,YL,ZH,ZL
+	ROTR64	ZH,ZL,WE,WE+1,^D41,U
+	XOR64	YH,YL,ZH,ZL
+	MOVE	ZH,WE		;Ch(e,f,g)
+	AND	ZH,WF
+	MOVE	U,WE
+	ANDCA	U,WG
+	XOR	ZH,U
+	MOVE	ZL,WE+1
+	AND	ZL,WF+1
+	MOVE	U,WE+1
+	ANDCA	U,WG+1
+	XOR	ZL,U
+	ADD	YH,ZH		;T1 = h + Sigma1 + Ch + K[t] + W[t]
+	ADD	YL,ZL
+	ADD	YH,WH
+	ADD	YL,WH+1
+	ADD	YH,K512(I)
+	ADD	YL,K512+1(I)
+	ADD	YH,W512(I)
+	ADD	YL,W512+1(I)
+	NORM64	YH,YL,U
+	DMOVEM	YH,TT1
+	ROTR64	YH,YL,WA,WA+1,^D28,U ;Sigma0(a)
+	ROTR64	ZH,ZL,WA,WA+1,^D34,U
+	XOR64	YH,YL,ZH,ZL
+	ROTR64	ZH,ZL,WA,WA+1,^D39,U
+	XOR64	YH,YL,ZH,ZL
+	MOVE	ZH,WB		;Maj(a,b,c)
+	IOR	ZH,WC
+	AND	ZH,WA
+	MOVE	U,WB
+	AND	U,WC
+	IOR	ZH,U
+	MOVE	ZL,WB+1
+	IOR	ZL,WC+1
+	AND	ZL,WA+1
+	MOVE	U,WB+1
+	AND	U,WC+1
+	IOR	ZL,U
+	ADD	YH,ZH		;T2 = Sigma0 + Maj (normalised below)
+	ADD	YL,ZL
+	DMOVE	U,WG		;h = g
+	DMOVEM	U,WH
+	DMOVE	U,WF		;g = f
+	DMOVEM	U,WG
+	DMOVE	U,WE		;f = e
+	DMOVEM	U,WF
+	DMOVE	U,WD		;e = d + T1
+	ADD	U,TT1
+	ADD	U2,TT1+1
+	NORM64	U,U2,ZH
+	DMOVEM	U,WE
+	DMOVE	U,WC		;d = c
+	DMOVEM	U,WD
+	DMOVE	U,WB		;c = b
+	DMOVEM	U,WC
+	DMOVE	U,WA		;b = a
+	DMOVEM	U,WB
+	ADD	YH,TT1		;a = T1 + T2
+	ADD	YL,TT1+1
+	NORM64	YH,YL,U
+	DMOVEM	YH,WA
+	ADDI	I,2
+	CAIGE	I,^D160
+	 JRST	C5123
+	MOVE	U2,CTX		;Add working variables into the state
+	MOVSI	XH,-20
+C5124:	DMOVE	YH,0(U2)
+	ADD	YH,WV(XH)
+	ADD	YL,WV+1(XH)
+	NORM64	YH,YL,U
+	DMOVEM	YH,0(U2)
+	ADDI	U2,2
+	AOBJN	XH,.+1
+	AOBJN	XH,C5124
+	RET
+
+	LIT
+
+	END

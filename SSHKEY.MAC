@@ -1,0 +1,358 @@
+	TITLE	SSHKEY - TOPS-20 SSH server: authorized keys
+
+;KEYCHK - is the key blob the client offered (PKBA/PKBL) listed for
+;user UNAM?
+;
+;The keys are in PS:<user>name, name from AUTHORIZED-KEYS in SSHD.CFG
+;(AKNAM), in the OpenSSH authorized_keys format, one key per line:
+;
+;	ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... comment
+;	ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... comment
+;
+;Blank lines and lines starting with ; ! or # are ignored.  Other key
+;types (ECDSA) and lines with options (from=..., command=...) are
+;skipped with a note in the log.  The file is not used if anybody but its owner and
+;group may write or append to it (world write/append access).
+;
+;WHEEL is enabled only while the file is opened and read (it may be
+;protected against SSHD).  No user job exists at that time.
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	UNAM,AKNAM,CAPON,CAPOFF,ERRMSG,R,RSKP
+	INTERN	KEYCHK,PKEY,KEYAUT,PKSIG,PKBA,PKBL,PKSGX,AUTHN,SDLEN,SDAT
+	INTERN	PKTYP,BPTR,BEND,RSARG
+
+AKMAX==^D10000			;Largest key file (characters)
+KLMAX==^D1000			;Longest line kept
+KBMAX==^D700			;Longest decoded key blob (4096-bit RSA: 535)
+
+PKEY:	BLOCK	^D32		;Key offered by the client
+PKSIG:	BLOCK	1		;Request has a signature
+PKTYP:	BLOCK	1		;0 ssh-ed25519, 1 rsa-sha2-256, 2 rsa-sha2-512
+BPTR:	BLOCK	1		;Parsing a blob in PAY: where we are
+BEND:	BLOCK	1		; and its end
+RSARG:	BLOCK	11		;RSAVFY argument block
+PKBA:	BLOCK	1		;Key blob in PAY: address
+PKBL:	BLOCK	1		; and length
+PKSGX:	BLOCK	1		;Index in PAY where the signature starts
+AUTHN:	BLOCK	1		;Authentication requests so far
+SDLEN:	BLOCK	1		;Signed data: length
+SDAT:	BLOCK	SDMAX		; and bytes (one per word)
+KEYAUT:	BLOCK	1		;Nonzero: key signature verified (TRYLOG)
+AKFIL:	BLOCK	^D20		;"PS:<user>name"
+AKJFN:	BLOCK	1
+AKPRT:	BLOCK	1		;File protection (.FBPRT)
+AKCNT:	BLOCK	1		;Characters left in AKBUF
+AKPTR:	BLOCK	1		;Where we are in AKBUF
+AKTRN:	BLOCK	1		;File was cut off
+KBLEN:	BLOCK	1		;Decoded blob length
+KBLOB:	BLOCK	KBMAX		;Decoded blob, one byte per word
+KLINE:	BLOCK	KLMAX/5+1	;Current line, ASCIZ
+AKBUF:	BLOCK	AKMAX/5+1	;The file
+
+;KEYCHK - skip return if the offered key is authorized for UNAM
+
+KEYCHK:	PUSH	P,Q1
+	PUSH	P,Q2
+	PUSH	P,Q3
+	MOVX	T1,RC%EMO	;Must be a real user name (it becomes part
+	HRROI	T2,UNAM		; of a file name)
+	RCUSR%
+	 ERJMP	KEYNO
+	TXNE	T1,RC%NOM!RC%AMB
+	 JRST	KEYNO
+	HRROI	T1,AKFIL	;"PS:<user>name"
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	HRROI	T2,UNAM
+	SOUT%
+	MOVEI	T2,">"
+	IDPB	T2,T1
+	HRROI	T2,AKNAM
+	SOUT%
+	IDPB	T3,T1
+	CALL	RDKEYS		;Read it into AKBUF
+	 JRST	KEYNO
+KEYLIN:	CALL	GETLIN		;Next line into KLINE
+	 JRST	KEYEND
+	CALL	KEYLN		;Does it hold our key?
+	 JRST	KEYLIN
+	POP	P,Q3		;Yes
+	POP	P,Q2
+	POP	P,Q1
+	RETSKP
+KEYEND:	SKIPN	AKTRN
+	 JRST	KEYEN1
+	TMSG	<%Key file longer than the >
+	MOVEI	T1,.PRIOU
+	MOVEI	T2,AKMAX
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	TMSG	< characters read: >
+	HRROI	T1,AKFIL
+	PSOUT%
+	TMSG	<
+>
+KEYEN1:	TMSG	<[Key not listed in >
+	HRROI	T1,AKFIL
+	PSOUT%
+	TMSG	<]
+>
+KEYNO:	POP	P,Q3
+	POP	P,Q2
+	POP	P,Q1
+	RET
+
+;RDKEYS - read AKFIL into AKBUF (AKCNT, AKPTR, AKTRN).  Skip if OK.
+
+RDKEYS:	CALL	CAPON
+	MOVX	T1,GJ%OLD!GJ%SHT
+	HRROI	T2,AKFIL
+	GTJFN%
+	 ERJMP	[CALL	CAPOFF
+		 TMSG	<[No key file >
+		 HRROI	T1,AKFIL
+		 PSOUT%
+		 TMSG	<]
+>
+		 RET]
+	MOVEM	T1,AKJFN
+	MOVE	T2,[1,,.FBPRT]	;Protection: nobody else may change it
+	MOVEI	T3,AKPRT
+	GTFDB%
+	 ERJMP	RDKBAD
+	MOVE	T1,AKPRT
+	TRNE	T1,24		;World write (20) or append (4) access?
+	 JRST	[CALL	CAPOFF
+		 TMSG	<?Key file ignored, others may write to it: >
+		 HRROI	T1,AKFIL
+		 PSOUT%
+		 TMSG	<
+>
+		 JRST	RDKREL]
+	MOVE	T1,AKJFN
+	MOVX	T2,FLD(7,OF%BSZ)!OF%RD
+	OPENF%
+	 ERJMP	RDKBAD
+	MOVE	T1,AKJFN	;Read it all (one character more than we
+	MOVE	T2,[POINT 7,AKBUF] ; keep, to see if it is cut off)
+	MOVNI	T3,AKMAX+1
+	SETZ	T4,
+	SIN%
+	 ERJMP	.+1		;End of file
+	MOVEI	T1,AKMAX+1	;T1 = characters read
+	ADD	T1,T3
+	SETZM	AKTRN
+	CAILE	T1,AKMAX
+	 SETOM	AKTRN
+	CAILE	T1,AKMAX
+	 MOVEI	T1,AKMAX
+	MOVEM	T1,AKCNT
+	MOVE	T1,[POINT 7,AKBUF]
+	MOVEM	T1,AKPTR
+	MOVE	T1,AKJFN
+	CLOSF%
+	 ERJMP	.+1
+	CALL	CAPOFF
+	RETSKP
+RDKBAD:	CALL	CAPOFF
+	TMSG	<?Can't read >
+	HRROI	T1,AKFIL
+	PSOUT%
+	TMSG	<: >
+	CALL	ERRMSG
+RDKREL:	MOVE	T1,AKJFN	;Release the JFN (closed or not)
+	TXO	T1,CZ%ABT
+	CLOSF%
+	 ERJMP	[MOVE	T1,AKJFN
+		 RLJFN%
+		  ERJMP	R
+		 RET]
+	RET
+
+;GETLIN - next line of AKBUF into KLINE (ASCIZ, CR/NUL dropped, TAB as
+;space, overlong lines cut).  Skip return, or non-skip at the end.
+
+GETLIN:	SKIPG	AKCNT
+	 RET
+	MOVE	Q1,[POINT 7,KLINE]
+	SETZ	Q2,		;Q2 = length
+GETLN1:	SOSGE	AKCNT
+	 JRST	GETLN3
+	ILDB	T1,AKPTR
+	CAIN	T1,12		;LF ends the line
+	 JRST	GETLN3
+	CAIE	T1,15
+	 CAIN	T1,0
+	  JRST	GETLN1
+	CAIN	T1,11
+	 MOVEI	T1," "
+	CAIL	Q2,KLMAX-1
+	 JRST	GETLN1
+	IDPB	T1,Q1
+	AOJA	Q2,GETLN1
+GETLN3:	SETZ	T1,
+	IDPB	T1,Q1
+	RETSKP
+
+;KEYLN - skip if the line in KLINE is "ssh-ed25519 <base64>" or
+;"ssh-rsa <base64>" and the decoded key blob is the one the client
+;offered (PKBA/PKBL in PAY).
+
+KEYLN:	MOVE	Q1,[POINT 7,KLINE]
+	CALL	SKSP		;T1 = first non-space character
+	JUMPE	T1,R		;Blank
+	CAIE	T1,";"		;Comment?
+	 CAIN	T1,"!"
+	  RET
+	CAIN	T1,"#"
+	 RET
+	MOVE	T1,[POINT 7,[ASCIZ /ssh-ed25519 /]]
+	CALL	KTYPE
+	 SKIPA
+	JRST	KEYLN2
+	MOVE	T1,[POINT 7,[ASCIZ /ssh-rsa /]]
+	CALL	KTYPE
+	 SKIPA
+	JRST	KEYLN2
+	TMSG	<[Skipped key line (only ssh-ed25519 and ssh-rsa keys are used): >
+	CALL	PRLINE
+	TMSG	<]
+>
+	RET
+KEYLN2:	CALL	SKSP
+	CALL	B64DEC		;Decode the key blob at Q1
+	 JRST	KEYLBD
+	MOVE	T1,KBLEN	;Same blob as offered?
+	CAME	T1,PKBL
+	 RET			;Another key
+	MOVN	T4,T1
+	HRLZS	T4
+	MOVE	T3,PKBA
+KEYLN4:	MOVE	T1,KBLOB(T4)
+	CAME	T1,(T3)
+	 RET			;Another key
+	ADDI	T3,1
+	AOBJN	T4,KEYLN4
+	TMSG	<[Key accepted:>	;Ours: show the rest (the comment)
+	MOVE	T1,Q1
+	PSOUT%
+	TMSG	<]
+>
+	RETSKP
+KEYLBD:	TMSG	<[Skipped bad key line: >
+	CALL	PRLINE
+	TMSG	<]
+>
+	RET
+
+;KTYPE - skip if KLINE at Q1 starts with the ASCIZ at byte pointer T1;
+;then Q1 is advanced past it.
+
+KTYPE:	MOVE	T2,Q1
+KTYPE1:	ILDB	T4,T1
+	JUMPE	T4,KTYPE2
+	ILDB	T3,T2
+	CAMN	T3,T4
+	 JRST	KTYPE1
+	RET
+KTYPE2:	MOVE	Q1,T2
+	RETSKP
+
+;PRLINE - print the start of KLINE (60 characters)
+
+PRLINE:	MOVEI	T1,.PRIOU
+	HRROI	T2,KLINE
+	MOVEI	T3,^D60		;Up to 60 characters or the NUL
+	SETZ	T4,
+	SOUT%
+	 ERJMP	.+1
+	RET
+
+;SKSP - skip spaces at Q1 (ILDB pointer): T1 = next character, Q1 left
+;just before it.
+
+SKSP:	MOVE	T2,Q1
+	ILDB	T1,Q1
+	CAIN	T1," "
+	 JRST	SKSP
+	MOVE	Q1,T2
+	RET
+
+;B64DEC - decode base64 at Q1 (ILDB pointer) into KBLOB/KBLEN, up to a
+;space or the end of the line.  Q1 is left at the terminator.  Skip
+;return if well formed.
+
+B64DEC:	SETZM	KBLEN
+	SETZB	Q2,Q3		;Q2 = bits, Q3 = number of bits
+B64D1:	MOVE	T2,Q1
+	ILDB	T1,Q1
+	JUMPE	T1,B64D8
+	CAIN	T1," "
+	 JRST	B64D8
+	CAIN	T1,"="		;Padding: the end (skip the rest)
+	 JRST	B64D7
+	CALL	B64VAL		;T1 = 0..63
+	 RET
+	LSH	Q2,6
+	IOR	Q2,T1
+	ADDI	Q3,6
+	CAIGE	Q3,^D8
+	 JRST	B64D1
+	SUBI	Q3,^D8		;A whole byte
+	MOVE	T1,Q2
+	MOVN	T2,Q3
+	LSH	T1,(T2)
+	ANDI	T1,377
+	MOVE	T2,KBLEN
+	CAIL	T2,KBMAX
+	 RET			;Too long
+	MOVEM	T1,KBLOB(T2)
+	AOS	KBLEN
+	MOVEI	T1,1		;Keep only the bits not used yet
+	LSH	T1,(Q3)
+	SUBI	T1,1
+	AND	Q2,T1
+	JRST	B64D1
+B64D7:	MOVE	T2,Q1		;Skip up to a space or the end
+	ILDB	T1,Q1
+	JUMPE	T1,B64D8
+	CAIE	T1," "
+	 JRST	B64D7
+B64D8:	MOVE	Q1,T2		;Back up to the terminator
+	SKIPE	KBLEN
+	 AOS	(P)
+	RET
+
+;B64VAL - T1 := value of base64 character T1.  Skip if valid.
+
+B64VAL:	CAIL	T1,"A"
+	 CAILE	T1,"Z"
+	  SKIPA
+	   JRST	[SUBI	T1,"A"
+		 RETSKP]
+	CAIL	T1,"a"
+	 CAILE	T1,"z"
+	  SKIPA
+	   JRST	[SUBI	T1,"a"-^D26
+		 RETSKP]
+	CAIL	T1,"0"
+	 CAILE	T1,"9"
+	  SKIPA
+	   JRST	[SUBI	T1,"0"-^D52
+		 RETSKP]
+	CAIN	T1,"+"
+	 JRST	[MOVEI	T1,^D62
+		 RETSKP]
+	CAIN	T1,"/"
+	 JRST	[MOVEI	T1,^D63
+		 RETSKP]
+	RET
+
+	LIT
+
+	END

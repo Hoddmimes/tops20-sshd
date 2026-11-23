@@ -1,0 +1,215 @@
+	TITLE	CHACHA - ChaCha20 stream cipher for TOPS-20
+
+;ChaCha20 block function (RFC 8439 / D. J. Bernstein).
+;
+;The caller owns a 16-word state: words 0-11 are set by CCINIT from
+;the key, words 12-15 are set by the caller:
+;  RFC 8439:            12 = block counter, 13-15 = 96-bit nonce
+;  chacha20-poly1305@openssh.com:
+;                       12-13 = 64-bit block counter, 14-15 = nonce
+;All state words are 32-bit values, right-justified.  Byte data is
+;one byte per word, as in the rest of the SSH code.
+;
+;Calls (clobber T1-T4 only):
+;  T1/ state  T2/ key (32 bytes)             CALL CCINIT
+;  T1/ state  T2/ out (64 bytes)             CALL CCBLK   ;One block
+;  T1/ state  T2/ data  T3/ count            CALL CCXOR
+;      XOR keystream into data in place, starting at the block counter
+;      in the state; the counter (words 12-13) is advanced per block.
+
+	SEARCH	MONSYM,MACSYM
+	SALL
+
+	INTERN	CCINIT,CCBLK,CCXOR
+
+	T1=1
+	T2=2
+	T3=3
+	T4=4
+	A=5
+	B=6
+	C=7
+	D=10
+	TMP=11
+	I=12
+	ST=13			;State address
+	DAT=14			;Data address
+	CNT=15			;Bytes left
+	P=17
+
+M32:	37777777777
+X:	BLOCK	^D16		;Working state
+KS:	BLOCK	^D64		;Keystream block for CCXOR
+
+DEFINE	SAVREG,<
+	PUSH	P,5
+	PUSH	P,6
+	PUSH	P,7
+	PUSH	P,10
+	PUSH	P,11
+	PUSH	P,12
+	PUSH	P,13
+	PUSH	P,14
+	PUSH	P,15
+>
+DEFINE	RSTREG,<
+	POP	P,15
+	POP	P,14
+	POP	P,13
+	POP	P,12
+	POP	P,11
+	POP	P,10
+	POP	P,7
+	POP	P,6
+	POP	P,5
+>
+
+;ROTL R,N - rotate the 32-bit value in R left N bits.
+
+DEFINE	ROTL(R,N),<
+	MOVE	TMP,R
+	LSH	TMP,-<^D32-<N>>
+	LSH	R,N
+	IOR	R,TMP
+	AND	R,M32
+>
+
+;QR IA,IB,IC,ID - ChaCha quarter round on X[IA..ID].
+
+DEFINE	QR(IA,IB,IC,ID),<
+	MOVE	A,X+IA
+	MOVE	B,X+IB
+	MOVE	C,X+IC
+	MOVE	D,X+ID
+	ADD	A,B
+	AND	A,M32
+	XOR	D,A
+	ROTL	D,^D16
+	ADD	C,D
+	AND	C,M32
+	XOR	B,C
+	ROTL	B,^D12
+	ADD	A,B
+	AND	A,M32
+	XOR	D,A
+	ROTL	D,^D8
+	ADD	C,D
+	AND	C,M32
+	XOR	B,C
+	ROTL	B,^D7
+	MOVEM	A,X+IA
+	MOVEM	B,X+IB
+	MOVEM	C,X+IC
+	MOVEM	D,X+ID
+>
+
+;LE32 R,ADR - R := little-endian 32-bit value of the bytes at ADR.
+;ADR is an address expression, possibly indexed.
+
+DEFINE	LE32(R,ADR),<
+	MOVE	R,3+ADR
+	LSH	R,^D8
+	IOR	R,2+ADR
+	LSH	R,^D8
+	IOR	R,1+ADR
+	LSH	R,^D8
+	IOR	R,0+ADR
+>
+
+SUBTTL	CCINIT
+
+CCINIT:	PUSH	P,A
+	MOVE	T3,[14134074145] ;"expand 32-byte k", little-endian
+	MOVEM	T3,0(T1)
+	MOVE	T3,[6310062156]
+	MOVEM	T3,1(T1)
+	MOVE	T3,[17130426462]
+	MOVEM	T3,2(T1)
+	MOVE	T3,[15310062564]
+	MOVEM	T3,3(T1)
+	MOVEI	T4,4(T1)	;Words 4-11 from the key
+	MOVEI	T3,^D8
+CCINI1:	LE32	A,(T2)
+	MOVEM	A,(T4)
+	ADDI	T2,4
+	ADDI	T4,1
+	SOJG	T3,CCINI1
+	POP	P,A
+	RET
+
+SUBTTL	CCBLK
+
+CCBLK:	SAVREG
+	MOVE	ST,T1
+	MOVE	DAT,T2
+	CALL	KSBLK
+	RSTREG
+	RET
+
+;KSBLK - one block of keystream from state ST into DAT (64 bytes).
+;Clobbers T1-T4, A-D, TMP, I.
+
+KSBLK:	HRLZ	T1,ST		;X := state
+	HRRI	T1,X
+	BLT	T1,X+17
+	MOVEI	I,^D10		;10 double rounds
+KSBLK1:	QR	^D0,^D4,^D8,^D12 ;Column rounds
+	QR	^D1,^D5,^D9,^D13
+	QR	^D2,^D6,^D10,^D14
+	QR	^D3,^D7,^D11,^D15
+	QR	^D0,^D5,^D10,^D15 ;Diagonal rounds
+	QR	^D1,^D6,^D11,^D12
+	QR	^D2,^D7,^D8,^D13
+	QR	^D3,^D4,^D9,^D14
+	SOJG	I,KSBLK1
+	MOVSI	I,-^D16		;Output (X + state), little-endian
+	MOVE	T2,DAT
+	MOVE	T3,ST
+KSBLK2:	MOVE	T1,X(I)
+	ADD	T1,(T3)
+	AND	T1,M32
+	MOVEI	T4,4
+KSBLK3:	MOVE	A,T1
+	ANDI	A,377
+	MOVEM	A,(T2)
+	LSH	T1,-^D8
+	ADDI	T2,1
+	SOJG	T4,KSBLK3
+	ADDI	T3,1
+	AOBJN	I,KSBLK2
+	RET
+
+SUBTTL	CCXOR
+
+CCXOR:	SAVREG
+	MOVE	ST,T1
+	MOVE	CNT,T3
+	MOVE	A,T2		;Data pointer
+	PUSH	P,A
+CCXOR1:	JUMPLE	CNT,CCXOR4
+	MOVEI	DAT,KS		;Next keystream block
+	CALL	KSBLK
+	AOS	T1,^D12(ST)	;Advance the block counter
+	CAMG	T1,M32		;Carry out of 32 bits?
+	 JRST	CCXOR2		;No
+	SETZM	^D12(ST)	;Yes, wrap and carry into word 13
+	AOS	T1,^D13(ST)
+	AND	T1,M32
+	MOVEM	T1,^D13(ST)
+CCXOR2:	POP	P,A		;XOR up to 64 bytes
+	MOVSI	I,-^D64
+CCXOR3:	MOVE	T1,KS(I)
+	XORM	T1,(A)
+	ADDI	A,1
+	SOJLE	CNT,CCXOR5
+	AOBJN	I,CCXOR3
+	PUSH	P,A
+	JRST	CCXOR1
+CCXOR5:	PUSH	P,A
+CCXOR4:	POP	P,A
+	RSTREG
+	RET
+
+	LIT
+
+	END

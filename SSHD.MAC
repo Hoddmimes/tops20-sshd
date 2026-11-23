@@ -1,0 +1,1335 @@
+	TITLE	SSHD - TOPS-20 SSH server
+
+	SEARCH	MONSYM,MACSYM,SSHDEF
+	SALL
+
+	EXTERN	ALGHK,AUTHF,B1,BASE9,CAPCHK,CAPOFF,CAPON,CFGRD
+	EXTERN	CFPORT,CHKALG,CLRPW,CONN,CPYSTR,CPYSTU,DECOUT,EDSIGN
+	EXTERN	ENDJOB,ERRMSG,ESK,EXHASH,FLUSH,GETVER,GPSTR,HAVSID
+	EXTERN	HH,HKEY,IC,ICLEN,JOB,KDF,KEYRX,KEYTX
+	EXTERN	KSB,KSBL,KSEC,LDHOST,LINE,LOGFLS,LOGINI,MKKEXI
+	EXTERN	MKKMP,MKTCPN,MYVER,NET,NETEOF,OCTOUT,OLEN,OP32
+	EXTERN	OPASZ,OPB,ORIGPJ,OSTR,PAY,PDL,PLEN,PRHEX
+	EXTERN	PRSTR,PRTIP,PTYJ,PUTN,PWA,PWL,QCB,QSB
+	EXTERN	RCVPKT,RDRFH,RDRFRK,RINGR,RINGW,RIX,RNDGET,RNDINI
+	EXTERN	RXENC,SEQI,SEQO,SID,SIG,SNDPKT,STREQ,TCPNAM
+	EXTERN	TRYLOG,TXENC,UNAM,UPSW,VC,VCLEN,VS,VSLEN
+	EXTERN	X25519
+	EXTERN	KEYCHK,KEYAUT,PKEY,PKSIG,PKBA,PKBL,PKSGX,AUTHN
+	EXTERN	SDLEN,SDAT,EDVRFY,GPBYT,USRDIS,PWAUTH,CFGQ
+	EXTERN	NSESS,SESFH,SESNO,NEWFH,FACS,MFULL,ISSESS,SPFH,CFMAXS,RNDMIX,RNDTIM
+	EXTERN	EXENAM,SACS,RNDB,MYUSR,NETMSG
+	EXTERN	PKTYP,BPTR,BEND,RSARG,RSAVFY,U4GET
+	EXTERN	LGDEAD,LGTMO,SESNUM,DRAIN,SPSTA,CTLSTP,CTLRST,CTLSTA,CFLGTO,CJBLK
+	INTERN	FATAL
+
+SUBTTL	Main program
+
+START:	RESET%
+	MOVE	P,[IOWD PDLEN,PDL]
+	CALL	LOGINI		;Output to SSHD.LOG
+	TMSG	<
+TOPS-20 SSH server phase 5 - login and shell
+>
+	CALL	CFGRD		;Read SSHD.CFG
+	CALL	RNDINI		;Seed the random pool
+	CALL	LDHOST		;Load or create the host key
+	CALL	CAPCHK		;Capability checks (password safety)
+	CALL	EXEINI		;Which SSHD.EXE the sessions run
+	MOVE	T1,[SIXBIT /SSHD/] ;Program name for SYSTAT
+	MOVE	T2,T1
+	SETSN%
+	 JFCL
+	TMSG	<[Listening on port >
+	MOVEI	T1,.PRIOU
+	MOVE	T2,CFPORT
+	MOVEI	T3,^D10
+	NOUT%
+	 JFCL
+	TMSG	<, at most >
+	MOVE	T2,CFMAXS
+	CALL	DECOUT
+	TMSG	< sessions]
+>
+	SETZM	NSESS
+	SETZM	SESNO
+	SETZM	NEWFH
+	SETZM	DRAIN
+	CALL	CTLINI		;Control file names
+
+;Main fork.  It never has WHEEL enabled: while the top fork of the job
+;has it enabled, TOPS-20 skips password checks for logins on our PTYs.
+;For every connection it starts a fork with a fresh copy of this
+;program (GET% of the same SSHD.EXE: private pages), passing the session
+;number, our primary JFNs and random bytes in its ACs.  That fork
+;listens on the port (with WHEEL enabled, which is safe in an inferior
+;fork), halts when a client connects, and is continued to serve that
+;connection, while the main fork starts the next listener.  At most MAX-SESSIONS (SSHD.CFG) at
+;once; when all are busy nobody listens (connections are refused).
+
+MLOOP:	CALL	REAP		;Remove finished sessions
+	MOVE	T1,NSESS
+	CAMGE	T1,CFMAXS	;All busy?
+	 JRST	MLOOP1
+	SKIPN	MFULL		;Yes: say so once, then wait
+	 CALL	FULMSG
+	SETOM	MFULL
+	CALL	LOGFLS
+	CALL	CTLCHK		;Stop/restart/status requests
+	JUMPN	T1,MSTOP
+	MOVEI	T1,^D1000
+	DISMS%
+	JRST	MLOOP
+MLOOP1:	SETZM	MFULL
+	CALL	LOGFLS		;Keep the log file up to date
+	SETOM	CFGQ		;Current SSHD.CFG (the port), quietly
+	CALL	CFGRD
+	SETZM	CFGQ
+	AOS	T1,SESNO	;Next session number, and a different random
+	CALL	RNDMIX		; pool for every fork
+	CALL	RNDTIM
+	MOVEI	T1,LSNF
+	MOVEM	T1,SPSTA
+	CALL	SPAWN		;Start the listener (T1 = fork handle)
+	 JRST	MLOOPW
+	MOVEM	T1,NEWFH
+MWAIT:	MOVE	T1,NEWFH	;Wait until it halts (with a connection),
+	RFSTS%			; checking every second for finished
+	 ERJMP	MWAIT2		; sessions meanwhile
+	TXZ	T1,RF%FRZ
+	HLRZ	T1,T1
+	CAIE	T1,.RFHLT
+	 CAIN	T1,.RFFPT
+	  JRST	MWAIT2
+	CALL	REAP		;Remove finished sessions
+	CALL	LOGFLS		;Keep the log file up to date
+	CALL	CTLCHK		;Stop/restart/status requests
+	JUMPN	T1,MSTOP
+	MOVEI	T1,^D1000
+	DISMS%
+	JRST	MWAIT
+MWAIT2:	MOVE	T1,NEWFH
+	MOVEI	T2,FACS
+	RFACS%
+	 ERJMP	.+1
+	MOVE	T1,FACS+1	;Its AC1 = 1: connected
+	CAIE	T1,1
+	 JRST	MLOOPF
+	SETZM	LQUIET		;Listening works
+	MOVE	T1,NEWFH	;Into the session table
+	CALL	ADDSES
+	MOVE	T1,NEWFH	;Continue it: it serves the connection
+	TXO	T1,SF%CON
+	SFORK%
+	 ERJMP	.+1
+	SETZM	NEWFH		;(No listener now)
+	JRST	MLOOP
+MLOOPF:	SETOM	LQUIET		;Listening failed (said once)
+	MOVE	T1,NEWFH
+	KFORK%
+	 ERJMP	.+1
+	SETZM	NEWFH
+MLOOPW:	MOVEI	T1,^D5000	;Try again in a while
+	DISMS%
+	JRST	MLOOP
+
+;SPAWN - create a fork, load our own SSHD.EXE (EXENAM, the exact
+;version we run) into it, give it our capabilities (WHEEL possible, not
+;enabled) and primary output, put the session number, our original
+;primary JFNs and 40 random bytes in its ACs, and start it at SPSTA
+;(LSNF for a listener/session, RSTRTF for the restart helper).
+;Skip return with T1 = fork handle.
+
+SPAWN:	PUSH	P,Q1
+	MOVX	T1,CR%CAP
+	CFORK%
+	 ERJMP	SPAWNE
+	MOVEM	T1,SPFH
+	MOVX	T1,GJ%OLD!GJ%SHT!GJ%DEL	;(Also when a newer SSHD.EXE has been
+	HRROI	T2,EXENAM		; installed: ours is then deleted, but
+	GTJFN%				; still there until EXPUNGE)
+	 ERJMP	SPAWNX
+	HRL	T1,SPFH		;Fork,,JFN
+	GET%			;(closes and releases the JFN)
+	 ERJMP	SPAWNK
+	MOVEI	T1,.FHSLF	;Our primary output (the log)
+	GPJFN%
+	MOVE	T1,SPFH
+	SPJFN%
+	 ERJMP	.+1
+	SETZM	FACS		;Its ACs
+	MOVE	T1,[FACS,,FACS+1]
+	BLT	T1,FACS+17
+	MOVE	T1,SESNO	;AC1 = session number
+	MOVEM	T1,FACS+1
+	MOVE	T1,ORIGPJ	;AC2 = original primary JFNs
+	MOVEM	T1,FACS+2
+	MOVEI	T1,RNDB		;AC3..AC12 = 40 random bytes
+	MOVEI	T2,^D40
+	CALL	RNDGET
+	MOVSI	Q1,-^D10
+SPAWN1:	HRRZ	T2,Q1		;Pack bytes 4i..4i+3
+	LSH	T2,2
+	MOVE	T1,RNDB(T2)
+	LSH	T1,^D8
+	IOR	T1,RNDB+1(T2)
+	LSH	T1,^D8
+	IOR	T1,RNDB+2(T2)
+	LSH	T1,^D8
+	IOR	T1,RNDB+3(T2)
+	MOVEM	T1,FACS+3(Q1)
+	AOBJN	Q1,SPAWN1
+	MOVE	T1,LQUIET	;AC13 = nonzero: don't report a failure to
+	MOVEM	T1,FACS+13	; listen (it was reported already)
+	MOVE	T1,SPFH
+	MOVEI	T2,FACS
+	SFACS%
+	 ERJMP	SPAWNK
+	MOVE	T1,SPFH
+	MOVE	T2,SPSTA	;Start address (LSNF, or RSTRTF)
+	SFORK%
+	 ERJMP	SPAWNK
+	MOVE	T1,SPFH
+	POP	P,Q1
+	AOS	(P)
+	RET
+SPAWNK:	TMSG	<?Can't start a session fork: >
+	CALL	ERRMSG
+	MOVE	T1,SPFH
+	KFORK%
+	 ERJMP	.+1
+	POP	P,Q1
+	RET
+SPAWNX:	TMSG	<?Can't find >
+	HRROI	T1,EXENAM
+	PSOUT%
+	TMSG	< (expunged?), restart the server: >
+	CALL	ERRMSG
+	MOVE	T1,SPFH
+	KFORK%
+	 ERJMP	.+1
+	POP	P,Q1
+	RET
+SPAWNE:	TMSG	<?Can't start a session fork: >
+	CALL	ERRMSG
+	POP	P,Q1
+	RET
+
+;EXEINI - EXENAM := full name of PS:<user>SSHD.EXE with its generation
+;(the version running now; session forks are loaded from it)
+
+EXEINI:	HRROI	T1,EXENAM
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	PUSH	P,T1
+	GJINF%			;Login user number (clobbers T1-T4)
+	MOVE	T2,T1
+	POP	P,T1
+	DIRST%
+	 ERJMP	FATAL
+	HRROI	T2,[ASCIZ />SSHD.EXE/]
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	MOVX	T1,GJ%OLD!GJ%SHT
+	HRROI	T2,EXENAM
+	GTJFN%
+	 ERJMP	FATAL
+	PUSH	P,T1
+	MOVE	T2,T1		;Full name, generation included
+	HRROI	T1,EXENAM
+	MOVX	T3,FLD(.JSAOF,JS%DEV)!FLD(.JSAOF,JS%DIR)!FLD(.JSAOF,JS%NAM)!FLD(.JSAOF,JS%TYP)!FLD(.JSAOF,JS%GEN)!JS%PAF
+	JFNS%
+	 ERJMP	FATAL
+	POP	P,T1
+	RLJFN%
+	 ERJMP	.+1
+	TMSG	<[Sessions run >
+	HRROI	T1,EXENAM
+	PSOUT%
+	TMSG	<]
+>
+	RET
+
+;Control files.  The main fork looks for these in the server's login
+;directory every second (create one with COPY NUL: PS:<SSHD>SSHD.STOP
+;etc.); it deletes the file and then:
+;  SSHD.STATUS	writes the state of the server and its forks to the log
+;  SSHD.STOP	stops listening; exits when the last session has ended
+;  SSHD.RESTART	stops listening, starts a new server job (the newest
+;		SSHD.EXE) at once, and exits when its sessions have ended
+
+;CTLINI - build the control file names
+
+CTLINI:	MOVEI	T1,CTLSTP
+	HRROI	T2,[ASCIZ /SSHD.STOP/]
+	CALL	CTLNM
+	MOVEI	T1,CTLRST
+	HRROI	T2,[ASCIZ /SSHD.RESTART/]
+	CALL	CTLNM
+	MOVEI	T1,CTLSTA
+	HRROI	T2,[ASCIZ /SSHD.STATUS/]
+	JRST	CTLNM
+
+;CTLNM - T1/ buffer := "PS:<user>" T2/ name
+
+CTLNM:	PUSH	P,T2
+	HRRO	T1,T1
+	HRROI	T2,[ASCIZ /PS:</]
+	SETZ	T3,
+	SOUT%
+	PUSH	P,T1
+	GJINF%			;Login user number (clobbers T1-T4)
+	MOVE	T2,T1
+	POP	P,T1
+	DIRST%
+	 ERJMP	.+1
+	MOVEI	T2,">"
+	IDPB	T2,T1
+	POP	P,T2
+	SETZ	T3,
+	SOUT%
+	IDPB	T3,T1
+	RET
+
+;CTLCHK - act on control files.  T1 := 0, or 1 (stop) / 2 (restart)
+
+CTLCHK:	HRROI	T2,CTLSTA	;Status: report, carry on
+	CALL	CTLFIL
+	 CALL	STATUS
+	HRROI	T2,CTLRST
+	CALL	CTLFIL
+	 JRST	[MOVEI	T1,2
+		 RET]
+	HRROI	T2,CTLSTP
+	CALL	CTLFIL
+	 JRST	[MOVEI	T1,1
+		 RET]
+	SETZ	T1,
+	RET
+
+;CTLSTQ - only SSHD.STATUS (for a server that is stopping)
+
+CTLSTQ:	HRROI	T2,CTLSTA
+	CALL	CTLFIL
+	 CALL	STATUS
+	RET
+
+;CTLFIL - non-skip return if the file named at T2 exists (it is then
+;deleted and expunged), skip return if not
+
+CTLFIL:	MOVX	T1,GJ%OLD!GJ%SHT
+	GTJFN%
+	 ERJMP	RSKP
+	HRRZS	T1		;(Just the JFN)
+	TXO	T1,DF%EXP	;Delete and expunge it
+	DELF%
+	 ERJMP	[HRRZS	T1	;Can't: release the JFN, act anyway
+		 RLJFN%
+		  ERJMP	R
+		 RET]
+	RET
+
+;MSTOP - stop (T1 = 1) or restart (T1 = 2): no more listening, a new
+;server for a restart, then wait for our sessions to end and exit.
+
+MSTOP:	MOVEM	T1,DRAIN
+	CAIN	T1,2		;Restart: keep the listener (see below)
+	 JRST	MSTOP1
+	SKIPE	T1,NEWFH	;Stop: kill the listener
+	 KFORK%
+	 ERJMP	.+1
+	SETZM	NEWFH
+	CALL	RELTCP		;Free its half-opened TCP: JFN, if any
+MSTOP1:
+	CALL	TSTAMP
+	HRROI	T1,[ASCIZ / [Stop requested: no longer accepting connections]
+/]
+	MOVE	T2,DRAIN
+	CAIN	T2,2
+	 HRROI	T1,[ASCIZ / [Restart requested: no longer accepting connections]
+/]
+	PSOUT%
+	MOVE	T1,DRAIN
+	CAIN	T1,2
+	 CALL	NEWSRV		;Restart: a new server job now
+	SETZM	MFULL
+;On a restart our listener is left alone: TOPS-20 keeps a killed
+;listener's TCB, and with it the port, until the job logs out.  The
+;next connection is therefore still served here; then the port is free
+;for the new server, which keeps trying.
+
+MDRAIN:	CALL	REAP		;Wait for our sessions to end
+	CALL	CTLSTQ		;(Status requests still work; stop/restart
+				; files are left for the active server)
+	SKIPE	NEWFH		;Our last listener got a connection?
+	 CALL	LSTCON
+	SKIPN	NSESS
+	 SKIPE	NEWFH		;(Done when no sessions and no listener)
+	  JRST	MDRAI0
+	JRST	MDRAI2
+MDRAI0:	SKIPE	MFULL
+	 JRST	MDRAI1
+	SETOM	MFULL
+	SKIPN	NSESS
+	 JRST	[TMSG	<[Waiting for one more connection (our listener holds the port)]
+>
+		 JRST	MDRAI1]
+	TMSG	<[Waiting for >
+	MOVE	T2,NSESS
+	CALL	DECOUT
+	TMSG	< session(s) to end>
+	SKIPE	NEWFH
+	 JRST	[TMSG	<, and one more connection]
+>
+		 JRST	MDRAI1]
+	TMSG	<]
+>
+MDRAI1:	CALL	LOGFLS
+	MOVEI	T1,^D1000
+	DISMS%
+	JRST	MDRAIN
+MDRAI2:	CALL	TSTAMP
+	TMSG	< [Server stopped]
+>
+	CALL	LOGFLS
+	HALTF%			;Top fork: the job goes away
+	JRST	MDRAIN
+
+;RELTCP - release TCP: JFNs that are not open.  JFNs belong to the job:
+;a listener killed in the middle of its OPENF% leaves its JFN, and with
+;it the port, until the job logs out.  Sessions' connections are open,
+;so they are not touched (and no other listener exists when this runs).
+
+RELTCP:	PUSH	P,Q1
+	MOVEI	Q1,1		;Q1 = JFN
+RELTC1:	MOVE	T1,Q1
+	GTSTS%
+	 ERJMP	RELTC3
+	TXNE	T2,GS%NAM	;A JFN, not open?
+	 TXNE	T2,GS%OPN
+	  JRST	RELTC3
+	HRROI	T1,RTBUF	;Its device
+	MOVE	T2,Q1
+	MOVX	T3,FLD(.JSAOF,JS%DEV)
+	JFNS%
+	 ERJMP	RELTC3
+	MOVE	T1,RTBUF
+	CAME	T1,[ASCIZ /TCP/]
+	 JRST	RELTC3
+	MOVE	T1,Q1		;Release it
+	TXO	T1,CZ%ABT
+	CLOSF%
+	 ERJMP	[MOVE	T1,Q1
+		 RLJFN%
+		  ERJMP	RELTC3
+		 JRST	RELTC2]
+RELTC2:	TMSG	<[Released the listener's TCP: JFN]
+>
+RELTC3:	CAIGE	Q1,^D200
+	 AOJA	Q1,RELTC1
+	POP	P,Q1
+	RET
+RTBUF:	BLOCK	4
+LQUIET:	BLOCK	1		;Listen failure reported
+
+;LSTCON - while draining: if the remaining listener has halted, serve
+;its connection as a session (or drop it if listening failed)
+
+LSTCON:	MOVE	T1,NEWFH
+	RFSTS%
+	 ERJMP	LSTCO2
+	TXZ	T1,RF%FRZ
+	HLRZ	T1,T1
+	CAIE	T1,.RFHLT
+	 CAIN	T1,.RFFPT
+	  SKIPA
+	RET			;Still listening
+	MOVE	T1,NEWFH
+	MOVEI	T2,FACS
+	RFACS%
+	 ERJMP	LSTCO2
+	MOVE	T1,FACS+1
+	CAIE	T1,1
+	 JRST	LSTCO2
+	MOVE	T1,NEWFH	;Connected: a session like any other
+	CALL	ADDSES
+	MOVE	T1,NEWFH
+	TXO	T1,SF%CON
+	SFORK%
+	 ERJMP	.+1
+	SETZM	NEWFH
+	SETZM	MFULL		;(Report the session count again)
+	RET
+LSTCO2:	MOVE	T1,NEWFH	;Failed or gone
+	KFORK%
+	 ERJMP	.+1
+	SETZM	NEWFH
+	RET
+
+;NEWSRV - start a new server job: a helper fork (RSTRTF) does the
+;CRJOB% with WHEEL enabled (an inferior: the top fork must never enable
+;it), and halts with the new job number (or -1) in AC1.
+
+NEWSRV:	MOVEI	T1,RSTRTF
+	MOVEM	T1,SPSTA
+	CALL	SPAWN
+	 RET			;(It said why)
+	MOVEM	T1,SPFH
+	MOVEI	T4,^D60		;Wait up to 30 seconds
+NEWSR1:	MOVE	T1,SPFH
+	RFSTS%
+	 ERJMP	NEWSR2
+	TXZ	T1,RF%FRZ
+	HLRZ	T1,T1
+	CAIE	T1,.RFHLT
+	 CAIN	T1,.RFFPT
+	  JRST	NEWSR2
+	MOVEI	T1,^D500
+	DISMS%
+	SOJG	T4,NEWSR1
+	TMSG	<?The restart helper did not finish
+>
+NEWSR2:	MOVE	T1,SPFH
+	KFORK%
+	 ERJMP	.+1
+	CALL	LOGFLS
+	RET
+
+;RSTRTF - the restart helper fork (fresh copy of SSHD.EXE): create a
+;detached job logged in as our user (no password: same user) running
+;PS:<user>SSHD.EXE, the newest version, as its top fork.
+
+RSTRTF:	MOVE	P,[IOWD PDLEN,PDL]
+	SETOM	ISSESS
+	MOVEI	T1,EXENAM	;"PS:<user>SSHD.EXE" (no generation)
+	HRROI	T2,[ASCIZ /SSHD.EXE/]
+	CALL	CTLNM
+	SETZM	CJBLK
+	MOVE	T1,[CJBLK,,CJBLK+1]
+	BLT	T1,CJBLK+17
+	HRROI	T1,EXENAM
+	MOVEM	T1,CJBLK+.CJFIL
+	MOVEI	T1,.NULIO	;Detached
+	MOVEM	T1,CJBLK+.CJTTY
+	MOVE	T1,[.NULIO,,.NULIO] ;Primary I/O NUL: a detached job's
+	MOVEM	T1,CJBLK+.CJPRI	; terminal output would wait forever
+	CALL	CAPON
+	MOVX	T1,CJ%LOG!CJ%FIL!CJ%SPJ!FLD(.CJUDA,CJ%ACT) ;(No CJ%NAM: our user)
+	MOVEI	T2,CJBLK
+	CRJOB%
+	 ERJMP	RSTRTE
+	PUSH	P,T1
+	CALL	CAPOFF
+	CALL	TSTAMP
+	TMSG	< [New server started as job >
+	MOVE	T2,(P)
+	CALL	DECOUT
+	TMSG	<]
+>
+	POP	P,T1
+	HALTF%
+	JRST	.-1
+RSTRTE:	CALL	CAPOFF
+	TMSG	<?Can't start a new server job: >
+	CALL	ERRMSG
+	SETO	T1,
+	HALTF%
+	JRST	.-1
+
+;STATUS - write the server's state to the log
+
+STATUS:	PUSH	P,Q1
+	CALL	TSTAMP
+	TMSG	< [Status: port >
+	MOVE	T2,CFPORT
+	CALL	DECOUT
+	TMSG	<, >
+	MOVE	T2,NSESS
+	CALL	DECOUT
+	TMSG	< of >
+	MOVE	T2,CFMAXS
+	CALL	DECOUT
+	TMSG	< sessions in use, latest session >
+	MOVE	T2,SESNO
+	CALL	DECOUT
+	SKIPN	DRAIN
+	 JRST	STAT0
+	TMSG	<, stopping>
+STAT0:	TMSG	<, running >
+	HRROI	T1,EXENAM
+	PSOUT%
+	TMSG	<]
+  [Listener: >
+	SKIPN	T1,NEWFH
+	 JRST	[TMSG	<none>
+		 JRST	STAT1]
+	CALL	FSTATE
+STAT1:	TMSG	<]
+>
+	MOVSI	Q1,-SMAX
+STAT2:	SKIPN	SESFH(Q1)
+	 JRST	STAT3
+	TMSG	<  [Session >
+	MOVE	T2,SESNUM(Q1)
+	CALL	DECOUT
+	TMSG	<: >
+	MOVE	T1,SESFH(Q1)
+	CALL	FSTATE
+	TMSG	<]
+>
+STAT3:	AOBJN	Q1,STAT2
+	CALL	LOGFLS
+	POP	P,Q1
+	RET
+
+;FSTATE - print the state and PC of fork T1
+
+FSTATE:	RFSTS%
+	 ERJMP	[TMSG	<gone>
+		 RET]
+	PUSH	P,T2
+	TXZ	T1,RF%FRZ
+	HLRZ	T1,T1
+	CAILE	T1,7
+	 MOVEI	T1,10
+	HRRO	T1,FSTNAM(T1)
+	PSOUT%
+	TMSG	<, PC >
+	POP	P,T2
+	HRRZ	T2,T2
+	CALL	OCTOUT
+	RET
+FSTNAM:	[ASCIZ /running/]
+	[ASCIZ /waiting for I-O/]
+	[ASCIZ /halted/]
+	[ASCIZ /terminated (error)/]
+	[ASCIZ /waiting for a fork/]
+	[ASCIZ /sleeping/]
+	[ASCIZ /trapped/]
+	[ASCIZ /at an address break/]
+	[ASCIZ /in an unknown state/]
+
+;TSTAMP - date and time to the log
+
+TSTAMP:	MOVEI	T1,.PRIOU
+	SETO	T2,
+	SETZ	T3,
+	ODTIM%
+	 ERJMP	.+1
+	RET
+
+;REAP - remove halted (finished) or crashed session forks
+
+REAP:	PUSH	P,Q1
+	MOVSI	Q1,-SMAX
+REAP1:	SKIPN	T1,SESFH(Q1)
+	 JRST	REAP3
+	RFSTS%
+	 ERJMP	REAP2		;Gone: forget it
+	TXZ	T1,RF%FRZ
+	HLRZ	T1,T1
+	CAIE	T1,.RFHLT
+	 CAIN	T1,.RFFPT
+	  JRST	REAP2
+	JRST	REAP3		;Still working
+REAP2:	MOVE	T1,SESFH(Q1)
+	KFORK%
+	 ERJMP	.+1
+	SETZM	SESFH(Q1)
+	SOS	NSESS
+REAP3:	AOBJN	Q1,REAP1
+	POP	P,Q1
+	RET
+
+;ADDSES - fork T1 into a free slot of the session table
+
+ADDSES:	MOVSI	T2,-SMAX
+ADDSE1:	SKIPE	SESFH(T2)
+	 AOBJN	T2,ADDSE1
+	JUMPGE	T2,R		;Full (can't happen: checked before)
+	MOVEM	T1,SESFH(T2)
+	MOVE	T1,SESNO
+	MOVEM	T1,SESNUM(T2)
+	AOS	NSESS
+	RET
+
+FULMSG:	MOVEI	T1,.PRIOU
+	SETO	T2,
+	SETZ	T3,
+	ODTIM%
+	 ERJMP	.+1
+	TMSG	< [All >
+	MOVE	T2,NSESS
+	CALL	DECOUT
+	TMSG	< sessions in use: not accepting connections]
+>
+	RET
+
+;LSNF - the listener/session fork.  Make all pages private first (they
+;are copy-on-write mappings of the main fork's pages, and it may change
+;them once it runs again), then listen.
+
+LSNF:	MOVEM	17,SACS+17	;Save the ACs from the main fork
+	MOVEI	17,SACS
+	BLT	17,SACS+16
+	MOVE	P,[IOWD PDLEN,PDL]
+	SETOM	ISSESS		;A session fork (no log flushing etc.)
+	MOVE	T1,SACS+1	;Session number
+	MOVEM	T1,SESNO
+	MOVE	T1,SACS+2	;Original primary JFNs (for the reader)
+	MOVEM	T1,ORIGPJ
+	CALL	RNDINI		;Random pool: our own sources, plus the
+	MOVSI	Q1,-^D10	; main fork's random bytes
+LSNF1:	MOVE	T1,SACS+3(Q1)
+	CALL	RNDMIX
+	AOBJN	Q1,LSNF1
+	GJINF%			;Our user number (refuse logins as it)
+	MOVEM	T1,MYUSR
+	SETOM	CFGQ		;SSHD.CFG (quietly)
+	CALL	CFGRD
+	SETZM	CFGQ
+	CALL	LDHOST		;Host key (quietly)
+	CALL	MKTCPN		;TCPNAM := "TCP:port." for CFPORT
+	MOVX	T1,GJ%SHT
+	HRROI	T2,TCPNAM
+	GTJFN%
+	 ERJMP	LSNFE
+	MOVEM	T1,NET
+	CALL	CAPON		;Privileged ports (< 256, >= 32768) need
+	MOVE	T1,NET		; WHEEL at OPENF%
+	MOVX	T2,FLD(8,OF%BSZ)!OF%RD!OF%WR
+	OPENF%
+	 ERJMP	[CALL	CAPOFF
+		 MOVE	T1,NET
+		 RLJFN%
+		  ERJMP	.+1
+		 JRST	LSNFE]
+	CALL	CAPOFF		;Connected: WHEEL off again
+	MOVEI	T1,1		;Tell the main fork (AC1 = 1) and wait to be
+	HALTF%			; continued
+
+	SETOM	CFGQ		;Re-read SSHD.CFG (quietly) for this login
+	CALL	CFGRD
+	SETZM	CFGQ
+	SETZM	LGTMO		;Login deadline (LOGIN-TIMEOUT)
+	SETZM	LGDEAD
+	SKIPN	CFLGTO
+	 JRST	LSNFT
+	TIME%
+	MOVE	T2,CFLGTO
+	IMULI	T2,^D1000
+	ADD	T1,T2
+	MOVEM	T1,LGDEAD
+LSNFT:	MOVEI	T1,.PRIOU	;Time stamp
+	SETO	T2,
+	SETZ	T3,
+	ODTIM%
+	 ERJMP	.+1
+	TMSG	< [Session >
+	MOVE	T2,SESNO
+	CALL	DECOUT
+	TMSG	<: connection from >
+	MOVE	T1,NET
+	GDSTS%
+	 ERJMP	.+1
+	MOVE	Q1,T3
+	MOVE	Q2,T4
+	CALL	PRTIP
+	TMSG	< port >
+	MOVE	T2,Q2
+	CALL	DECOUT
+	TMSG	<]
+>
+	CALL	LOGFLS
+	SETZM	RINGW		;Start the reader fork
+	SETZM	RINGR
+	SETZM	NETEOF
+	SETZM	JOB
+	SETZM	PTYJ
+	MOVX	T1,CR%MAP!CR%CAP!CR%ST
+	HRRI	T1,RDRFRK
+	CFORK%
+	 ERJMP	FATAL
+	MOVEM	T1,RDRFH
+	MOVE	T2,ORIGPJ	;Its primary output must not be the log
+	SKIPE	ORIGPJ		; (the log could not be closed then)
+	 SPJFN%
+	 ERJMP	.+1
+	CALL	SESSN		;Run the protocol
+	CALL	ENDJOB		;Log out the user's job, close the PTY
+	TMSG	<[Session >
+	MOVE	T2,SESNO
+	CALL	DECOUT
+	TMSG	< closed]
+>
+	CALL	LOGFLS
+	MOVE	T1,RDRFH	;Stop the reader fork
+	KFORK%
+	 ERJMP	.+1
+	SKIPE	LGTMO		;Timed out (stalled): don't wait for TCP
+	 JRST	CLSABT
+	MOVE	T1,NET
+	CLOSF%
+	 ERJMP	CLSABT
+	JRST	LSNFX
+CLSABT:	MOVE	T1,NET		;Normal close failed: abort it
+	TXO	T1,CZ%ABT
+	CLOSF%
+	 ERJMP	.+1
+LSNFX:	SETZ	T1,		;Done: halt, the main fork removes us
+	HALTF%
+	JRST	LSNFX
+
+LSNFE:	SKIPE	SACS+13		;Reported already?
+	 JRST	LSNFE1
+	TMSG	<?Can't listen (will keep trying every 5 seconds): >
+	CALL	ERRMSG
+LSNFE1:
+	SETZ	T1,		;AC1 = 0: failed
+	HALTF%
+	JRST	LSNFE
+
+FATAL:	CALL	ERRMSG
+	CALL	LOGFLS
+	HALTF%
+	JRST	START
+
+;SESSN - one SSH connection.  Returns when it is over.
+
+SESSN:	SETZM	SEQI
+	SETZM	SEQO
+	SETZM	RXENC
+	SETZM	TXENC
+	SETZM	HAVSID
+
+	MOVE	T1,[POINT 7,MYVER] ;VS := our identification string
+	SETZ	Q1,
+SESS1:	ILDB	T2,T1
+	JUMPE	T2,SESS2
+	MOVEM	T2,VS(Q1)
+	AOJA	Q1,SESS1
+SESS2:	MOVEM	Q1,VSLEN
+	MOVEI	T2,VS		;Send it with CR LF
+	MOVE	T3,Q1
+	CALL	PUTN
+	 RET
+	MOVEI	T2,15
+	MOVEM	T2,B1
+	MOVEI	T2,B1
+	MOVEI	T3,1
+	CALL	PUTN
+	 RET
+	MOVEI	T2,12
+	MOVEM	T2,B1
+	MOVEI	T2,B1
+	MOVEI	T3,1
+	CALL	PUTN
+	 RET
+	CALL	FLUSH
+
+	CALL	GETVER		;Client identification string
+	 JRST	NETERR
+	TMSG	<Client: >
+	MOVEI	T2,VC
+	MOVE	T3,VCLEN
+	CALL	PRSTR
+	TMSG	<
+>
+
+	CALL	MKKEXI		;Our KEXINIT
+	CALL	SNDPKT
+	 JRST	NETERR
+
+	CALL	RCVPKT		;Client KEXINIT
+	 JRST	NETERR
+	CAIE	T1,SSHKEX
+	 JRST	UNEXP
+	MOVE	T1,PLEN		;Keep a copy for the exchange hash
+	CAILE	T1,OMAX
+	 JRST	BADPKT
+	MOVEM	T1,ICLEN
+	SETZ	Q1,
+SESS3:	MOVE	T2,PAY(Q1)
+	MOVEM	T2,IC(Q1)
+	ADDI	Q1,1
+	CAMGE	Q1,T1
+	 JRST	SESS3
+	CALL	CHKALG		;Do we agree on the algorithms?
+	 JRST	NOALG
+
+	CALL	RCVPKT		;KEX_ECDH_INIT
+	 JRST	NETERR
+	CAIE	T1,SSHECI
+	 JRST	UNEXP
+	MOVEI	T1,1
+	MOVEM	T1,RIX
+	CALL	GPSTR		;string Q_C
+	 JRST	BADPKT
+	CAIE	T3,^D32
+	 JRST	BADPKT
+	MOVSI	Q1,-^D32
+SESS4:	MOVE	T1,(T2)
+	MOVEM	T1,QCB(Q1)
+	ADDI	T2,1
+	AOBJN	Q1,SESS4
+
+	TMSG	<[Key exchange: curve25519-sha256]
+>
+	MOVEI	T1,ESK		;Ephemeral key pair
+	MOVEI	T2,^D32
+	CALL	RNDGET
+	MOVEI	T1,QSB
+	MOVEI	T2,ESK
+	MOVEI	T3,BASE9
+	CALL	X25519
+	MOVEI	T1,KSEC		;Shared secret
+	MOVEI	T2,ESK
+	MOVEI	T3,QCB
+	CALL	X25519
+	SETZ	T1,		;All zero is not allowed (RFC 7748 6.1)
+	MOVSI	Q1,-^D32
+SESS5:	IOR	T1,KSEC(Q1)
+	AOBJN	Q1,SESS5
+	JUMPE	T1,BADKEX
+	CALL	MKKMP		;K as mpint
+	CALL	EXHASH		;H
+	SKIPE	HAVSID		;First exchange: session id = H
+	 JRST	SESS6
+	MOVSI	Q1,-^D32
+SESS7:	MOVE	T1,HH(Q1)
+	MOVEM	T1,SID(Q1)
+	AOBJN	Q1,SESS7
+	SETOM	HAVSID
+SESS6:	TMSG	<H = >
+	MOVEI	T2,HH
+	MOVEI	T3,^D32
+	CALL	PRHEX
+	MOVEI	T1,SIG		;Sign H with the host key
+	MOVEI	T2,HKEY
+	MOVEI	T3,HH
+	MOVEI	T4,^D32
+	CALL	EDSIGN
+
+	SETZM	OLEN		;KEX_ECDH_REPLY
+	MOVEI	T1,SSHECR
+	CALL	OPB
+	MOVEI	T2,KSB		;string K_S
+	MOVE	T3,KSBL
+	CALL	OSTR
+	MOVEI	T2,QSB		;string Q_S
+	MOVEI	T3,^D32
+	CALL	OSTR
+	MOVEI	T1,4+^D11+4+^D64 ;string signature blob
+	CALL	OP32
+	MOVEI	T2,ALGHK
+	CALL	OPASZ
+	MOVEI	T2,SIG
+	MOVEI	T3,^D64
+	CALL	OSTR
+	CALL	SNDPKT
+	 JRST	NETERR
+
+	SETZM	OLEN		;NEWKEYS
+	MOVEI	T1,SSHNEW
+	CALL	OPB
+	CALL	SNDPKT
+	 JRST	NETERR
+	MOVEI	T1,"D"		;Keys: server to client 'D',
+	MOVEI	T2,KEYTX	; client to server 'C'
+	CALL	KDF
+	MOVEI	T1,"C"
+	MOVEI	T2,KEYRX
+	CALL	KDF
+	SETOM	TXENC		;Send side encrypted from now on
+
+	CALL	RCVPKT		;Client NEWKEYS
+	 JRST	NETERR
+	CAIE	T1,SSHNEW
+	 JRST	UNEXP
+	SETOM	RXENC		;Receive side encrypted from now on
+	TMSG	<[NEWKEYS done, connection encrypted]
+>
+	CALL	EXTINF		;EXT_INFO, if the client wants it
+
+	CALL	RCVPKT		;SERVICE_REQUEST (first encrypted packet)
+	 JRST	NETERR
+	CAIE	T1,SSHSRQ
+	 JRST	UNEXP
+	MOVEI	T1,1
+	MOVEM	T1,RIX
+	CALL	GPSTR
+	 JRST	BADPKT
+	PUSH	P,T2
+	PUSH	P,T3
+	TMSG	<Service request: >
+	CALL	PRSTR
+	TMSG	<
+>
+	SETZM	OLEN		;SERVICE_ACCEPT with the same name
+	MOVEI	T1,SSHSAC
+	CALL	OPB
+	POP	P,T3
+	POP	P,T2
+	CALL	OSTR
+	CALL	SNDPKT
+	 JRST	NETERR
+
+;User authentication: "publickey" (ssh-ed25519 keys listed in the
+;user's authorized keys file) and "password" (unless SSHD.CFG has
+;PASSWORD-AUTHENTICATION NO).  Users listed with DISABLE-USER are
+;refused.  3 failed passwords or signatures, or 20 requests in all,
+;disconnect.
+
+	SETZM	AUTHF
+	SETZM	AUTHN
+	SETZM	KEYAUT
+AUTHL:	CALL	RCVPKT		;USERAUTH_REQUEST
+	 JRST	NETERR
+	CAIE	T1,SSHUAR
+	 JRST	UNEXP
+	AOS	T1,AUTHN
+	CAILE	T1,^D20
+	 JRST	[HRROI	T1,[ASCIZ /Too many authentication requests/]
+		 JRST	DISCON]
+	MOVEI	T1,1
+	MOVEM	T1,RIX
+	CALL	GPSTR		;user name
+	 JRST	BADPKT
+	MOVEI	T1,UNAM
+	CALL	CPYSTU		;ASCIZ, upper case
+	 JRST	AUTHNO		;Too long: just fail
+	CALL	USRDIS		;DISABLE-USER in SSHD.CFG?
+	 SKIPA
+	JRST	AUTHDU
+	CALL	GPSTR		;service (ssh-connection)
+	 JRST	BADPKT
+	CALL	GPSTR		;method
+	 JRST	BADPKT
+	HRROI	T1,[ASCIZ /publickey/]
+	CALL	STREQ
+	 SKIPA
+	JRST	AUTHPK
+	HRROI	T1,[ASCIZ /password/]
+	CALL	STREQ
+	 JRST	AUTHNO		;Anything else: list our methods
+	SKIPN	PWAUTH		;PASSWORD-AUTHENTICATION NO?
+	 JRST	AUTHPD
+	AOS	RIX		;Skip the boolean (FALSE: not a change)
+	CALL	GPSTR		;password
+	 JRST	BADPKT
+	MOVEM	T2,PWA
+	MOVEM	T3,PWL
+	MOVEI	T1,UPSW
+	CALL	CPYSTR
+	 JRST	AUTHBD
+	TMSG	<[Password login attempt for user >
+	HRROI	T1,UNAM
+	PSOUT%
+	TMSG	<]
+>
+	SETZM	KEYAUT		;TOPS-20 must check the password
+	CALL	TRYLOG		;Create the job; TOPS-20 checks the password
+	 JRST	AUTHBD
+AUTHOK:	SETZM	LGDEAD		;Logged in: no more deadline
+	CALL	CLRPW
+	TMSG	<[Logged in: job >
+	MOVE	T2,JOB
+	CALL	DECOUT
+	TMSG	< on TTY>
+	MOVE	T2,LINE
+	CALL	OCTOUT
+	TMSG	<]
+>
+	SETZM	OLEN		;USERAUTH_SUCCESS
+	MOVEI	T1,SSHUAS
+	CALL	OPB
+	CALL	SNDPKT
+	 JRST	NETERR
+	JRST	CONN		;On to the connection protocol
+
+;"publickey": boolean has-signature, string algorithm, string key blob
+;[, string signature].  The signature covers string session_id followed
+;by the request up to (not including) the signature string.
+
+AUTHPK:	CALL	GPBYT		;has-signature
+	 JRST	BADPKT
+	MOVEM	T1,PKSIG
+	CALL	GPSTR		;algorithm
+	 JRST	BADPKT
+	SETZ	Q1,		;Q1 = its number (PKTYP)
+AUTHA1:	MOVE	T1,ALGTAB(Q1)
+	CALL	STREQ
+	 SKIPA
+	JRST	AUTHA2
+	CAIGE	Q1,2
+	 AOJA	Q1,AUTHA1
+	PUSH	P,T2		;Not one of ours
+	PUSH	P,T3
+	TMSG	<[Public key type not supported: >
+	POP	P,T3
+	POP	P,T2
+	CALL	PRSTR
+	TMSG	<]
+>
+	JRST	AUTHNO
+AUTHA2:	MOVEM	Q1,PKTYP
+	CALL	GPSTR		;key blob
+	 JRST	BADPKT
+	MOVEM	T2,PKBA
+	MOVEM	T3,PKBL
+	MOVEM	T2,BPTR		;Parse it: string key type
+	ADD	T3,T2
+	MOVEM	T3,BEND
+	CALL	GBSTR
+	 JRST	AUTHNO
+	MOVE	T1,KTYTAB(Q1)	;Must fit the algorithm
+	CALL	STREQ
+	 JRST	AUTHNO
+	JUMPN	Q1,AUTHA3
+	CALL	GBSTR		;ssh-ed25519: string key (32)
+	 JRST	AUTHNO
+	CAIE	T3,^D32
+	 JRST	AUTHNO
+	HRLZ	T1,T2
+	HRRI	T1,PKEY
+	BLT	T1,PKEY+^D31
+	JRST	AUTHA4
+AUTHA3:	CALL	GBSTR		;ssh-rsa: mpint e, mpint n
+	 JRST	AUTHNO
+	MOVEM	T2,RSARG+0	;RA.EA, RA.EL
+	MOVEM	T3,RSARG+1
+	CALL	GBSTR
+	 JRST	AUTHNO
+	MOVEM	T2,RSARG+2	;RA.NA, RA.NL
+	MOVEM	T3,RSARG+3
+AUTHA4:	MOVE	T1,BPTR		;Nothing may follow
+	CAME	T1,BEND
+	 JRST	AUTHNO
+	MOVE	T1,RIX		;The signature (if any) starts here
+	MOVEM	T1,PKSGX
+	TMSG	<[Public key >
+	HRROI	T1,[ASCIZ /query/]
+	SKIPE	PKSIG
+	 HRROI	T1,[ASCIZ /login/]
+	PSOUT%
+	TMSG	< (>
+	HRRO	T1,ALGTAB(Q1)
+	PSOUT%
+	TMSG	<) for user >
+	HRROI	T1,UNAM
+	PSOUT%
+	TMSG	<]
+>
+	CALL	KEYCHK		;Listed for this user?
+	 JRST	AUTHNO
+	SKIPE	PKSIG
+	 JRST	AUTHP2
+	SETZM	OLEN		;Query: USERAUTH_PK_OK, algorithm, blob
+	MOVEI	T1,SSHPKO
+	CALL	OPB
+	MOVE	T1,PKTYP
+	HRRZ	T2,ALGTAB(T1)
+	CALL	OPASZ
+	MOVE	T2,PKBA
+	MOVE	T3,PKBL
+	CALL	OSTR
+	CALL	SNDPKT
+	 JRST	NETERR
+	JRST	AUTHL
+
+AUTHP2:	CALL	GPSTR		;signature: string algorithm, string sig
+	 JRST	BADPKT
+	MOVEM	T2,BPTR
+	ADD	T3,T2
+	MOVEM	T3,BEND
+	CALL	GBSTR
+	 JRST	AUTHSB
+	MOVE	Q1,PKTYP	;Same algorithm as requested
+	MOVE	T1,ALGTAB(Q1)
+	CALL	STREQ
+	 JRST	AUTHSB
+	CALL	GBSTR		;The signature itself
+	 JRST	AUTHSB
+	MOVE	Q2,T2		;Q2/Q3 = signature bytes, length
+	MOVE	Q3,T3
+	MOVE	T1,PKSGX	;Signed data: string session id, then the
+	CAILE	T1,SDMAX-4-^D32	; request up to the signature
+	 JRST	AUTHSB
+	ADDI	T1,4+^D32
+	MOVEM	T1,SDLEN
+	SETZM	SDAT
+	SETZM	SDAT+1
+	SETZM	SDAT+2
+	MOVEI	T1,^D32
+	MOVEM	T1,SDAT+3
+	MOVE	T1,[SID,,SDAT+4]
+	BLT	T1,SDAT+4+^D31
+	MOVSI	T1,PAY		;PAY[0..PKSGX-1]
+	HRRI	T1,SDAT+4+^D32
+	MOVE	T2,PKSGX
+	BLT	T1,SDAT+4+^D32-1(T2)
+	JUMPN	Q1,AUTHP3
+	CAIE	Q3,^D64		;Ed25519
+	 JRST	AUTHSB
+	MOVE	T1,Q2
+	MOVEI	T2,PKEY
+	MOVEI	T3,SDAT
+	MOVE	T4,SDLEN
+	CALL	EDVRFY
+	 JRST	AUTHSB
+	JRST	AUTHP4
+AUTHP3:	MOVEM	Q2,RSARG+4	;RSA: RA.SA, RA.SL
+	MOVEM	Q3,RSARG+5
+	MOVEI	T1,SDAT		;RA.MA, RA.ML
+	MOVEM	T1,RSARG+6
+	MOVE	T1,SDLEN
+	MOVEM	T1,RSARG+7
+	MOVE	T1,Q1		;RA.H: 0 SHA-256, 1 SHA-512
+	SUBI	T1,1
+	MOVEM	T1,RSARG+10
+	MOVEI	T1,RSARG
+	CALL	RSAVFY
+	 JRST	AUTHSB
+AUTHP4:	TMSG	<[Signature verified]
+>
+	CALL	CLRPW		;No password: the key is the proof
+	SETOM	KEYAUT
+	CALL	TRYLOG		;Create the job
+	 JRST	AUTHBD
+	JRST	AUTHOK
+
+;Signature algorithms (PKTYP 0-2) and the key types they go with
+
+ALGTAB:	[ASCIZ /ssh-ed25519/]
+	[ASCIZ /rsa-sha2-256/]
+	[ASCIZ /rsa-sha2-512/]
+KTYTAB:	[ASCIZ /ssh-ed25519/]
+	[ASCIZ /ssh-rsa/]
+	[ASCIZ /ssh-rsa/]
+
+;GBSTR - next SSH string of the blob at BPTR (ending at BEND): T2/T3 =
+;address/length.  Skip return if it fits.
+
+GBSTR:	MOVE	T2,BPTR
+	MOVEI	T1,4(T2)
+	CAMLE	T1,BEND
+	 RET
+	CALL	U4GET		;T1 = length
+	MOVE	T2,BPTR
+	ADDI	T2,4
+	MOVE	T3,T1
+	ADD	T1,T2
+	CAMLE	T1,BEND
+	 RET
+	MOVEM	T1,BPTR
+	RETSKP
+
+;EXTINF - if the client asked for it (ext-info-c in its KEXINIT), send
+;EXT_INFO (RFC 8308) with server-sig-algs, so that clients sign with
+;rsa-sha2-256/512 rather than the old SHA-1 ssh-rsa.
+
+EXTINF:	SETZ	T4,		;T4 = start index in IC
+EXTIN1:	MOVE	T1,T4
+	ADDI	T1,^D10
+	CAMLE	T1,ICLEN
+	 RET			;Not there
+	MOVSI	T3,-^D10
+EXTIN2:	HRRZ	T1,T3
+	ADD	T1,T4
+	MOVE	T1,IC(T1)
+	CAME	T1,EXTSTR(T3)
+	 AOJA	T4,EXTIN1
+	AOBJN	T3,EXTIN2
+	SETZM	OLEN		;Found
+	MOVEI	T1,SSHEXT
+	CALL	OPB
+	MOVEI	T1,1		;One extension
+	CALL	OP32
+	MOVEI	T2,[ASCIZ /server-sig-algs/]
+	CALL	OPASZ
+	MOVEI	T2,[ASCIZ /ssh-ed25519,rsa-sha2-256,rsa-sha2-512/]
+	CALL	OPASZ
+	CALL	SNDPKT
+	 JFCL
+	RET
+EXTSTR:	BYTE	(36) "e","x","t","-","i","n","f","o","-","c"
+
+AUTHSB:	TMSG	<?Bad signature
+>
+AUTHBD:	SETZM	KEYAUT
+	CALL	CLRPW
+	AOS	T1,AUTHF
+	CAIGE	T1,3
+	 JRST	AUTHNO
+	HRROI	T1,[ASCIZ /Too many authentication failures/]
+	JRST	DISCON
+AUTHDU:	TMSG	<?Refused: user >	;The client just sees a failure
+	HRROI	T1,UNAM
+	PSOUT%
+	TMSG	< is disabled in SSHD.CFG
+>
+	JRST	AUTHNO
+AUTHPD:	TMSG	<?Refused: password logins are disabled in SSHD.CFG (user >
+	HRROI	T1,UNAM
+	PSOUT%
+	TMSG	<)
+>
+AUTHNO:	SETZM	OLEN		;USERAUTH_FAILURE: can continue with
+	MOVEI	T1,SSHUAF	; these, no partial success
+	CALL	OPB
+	MOVEI	T2,[ASCIZ /publickey,password/]
+	SKIPN	PWAUTH
+	 MOVEI	T2,[ASCIZ /publickey/]
+	CALL	OPASZ
+	SETZ	T1,
+	CALL	OPB
+	CALL	SNDPKT
+	 JRST	NETERR
+	JRST	AUTHL
+
+;Error exits from SESSN.  All return to the caller, which closes.
+
+NETERR:	CALL	NETMSG		;Client disconnected, or an error
+	RET
+BADPKT:	HRROI	T1,[ASCIZ /Malformed packet/]
+	JRST	DISCON
+BADKEX:	HRROI	T1,[ASCIZ /Bad key exchange value/]
+	JRST	DISCON
+NOALG:	HRROI	T1,[ASCIZ /No common algorithms (need curve25519-sha256, ssh-ed25519, chacha20-poly1305@openssh.com)/]
+	JRST	DISCON
+UNEXP:	PUSH	P,T1
+	TMSG	<?Unexpected message type >
+	POP	P,T2
+	CALL	DECOUT
+	TMSG	<
+>
+	HRROI	T1,[ASCIZ /Unexpected message/]
+
+;DISCON - send DISCONNECT (reason 11, by application) with the ASCIZ
+;text at T1, and return.
+
+DISCON:	PUSH	P,T1
+	TMSG	<[Disconnect: >
+	MOVE	T1,(P)
+	PSOUT%
+	TMSG	<]
+>
+	SETZM	OLEN
+	MOVEI	T1,SSHDIS
+	CALL	OPB
+	MOVEI	T1,^D11
+	CALL	OP32
+	POP	P,T2
+	CALL	OPASZ
+	SETZ	T1,		;Empty language tag
+	CALL	OP32
+	CALL	SNDPKT
+	 JFCL
+	RET
+
+
+	LIT
+
+	END	START
