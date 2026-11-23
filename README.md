@@ -24,9 +24,9 @@ This projects contains the code	for building and SSH service for the TOPS-20 ope
 
 ### How configure and run the the SSHD
 
-- Create an directory e.g PS:\<SSHD>
+- Create a directory e.g PS:\<SSHD>
 - Must have wheel capabilities
-- Copy the executables SSHD.EXE and SSHRUN:EXE to the created directory
+- Copy the executables SSHD.EXE and SSHRUN.EXE to the created directory
 - Copy the file SSHD.CFG to the created directory, edit the file after your desire
 
 ```
@@ -80,6 +80,7 @@ The setting _AUTHORIZED-KEYS_ in the SSHD.CFG will point out the file where the 
 ; One key per line, as in OpenSSH's authorized_keys:
 ;   ssh-ed25519 <base64 key> <comment>
 ;   ssh-rsa <base64 key> <comment>      (RSA 1024-4096 bits)
+;   Other key formats currently not suported.
 ;
 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC1DC9mXzYJG51234567890TVgVpd7ggggggggggg4871yhOJQZUXyj3GIywsRoEGSPM4nsF7sXfk4PsxxxxxxxxxxK30Rp2GAV+n
 9DNPmcQ2j4SPtVwrvUKMXiU4jpHrr7cd4EeOEyyyyyyyyyyV4Hozy+l4XHfHU8y2TgdWFghRhg32dmj21gDE8o72P1rTGRg2T0Rwtb3nFTCmj+ahAk2SpoEvg4tjuQphyvEIuNdYze
