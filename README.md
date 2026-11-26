@@ -22,6 +22,15 @@ This projects contains the code	for building and SSH service for the TOPS-20 ope
 @SAVE SSHRUN
 ```
 
+The script BUILD.CMD will compile and build the SSHD and the SSHRUN executables
+```
+@TAKE BUILD.CMD
+```
+
+
+
+
+
 ### How configure and run the the SSHD
 
 - Create a directory e.g PS:\<SSHD>
