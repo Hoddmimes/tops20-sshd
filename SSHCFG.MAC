@@ -5,6 +5,7 @@
 
 	EXTERN	ERRMSG,R,RSKP,UNAM
 	INTERN	AKNAM,CFGRD,CFPORT,MKTCPN,TCPNAM,PWAUTH,USRDIS,CFGQ,CFMAXS,CFLGTO
+	INTERN	TAKLGC
 
 	SUBTTL	Configuration file (SSHD.CFG)
 
@@ -22,6 +23,8 @@
 ;					(one per line, up to 50)
 ;	MAX-SESSIONS 8			concurrent sessions (1-16)
 ;	LOGIN-TIMEOUT 120		seconds to log in (0 = no limit)
+;	LOGIN-CMD YES			shell sessions TAKE LOGIN.CMD
+;					first, as at a terminal (default NO)
 ;
 ;Missing file or bad lines: defaults (port 22, SSH-AUTH-KEYS.TXT,
 ;passwords allowed, no disabled users) and a %SSHD.CFG warning in the
@@ -36,6 +39,7 @@ CFPORT:	BLOCK	1		;Port to listen on
 AKNAM:	BLOCK	10		;Authorized keys file name, ASCIZ
 AKTMP:	BLOCK	10		;Value being parsed (ASCIZ, upper case)
 PWAUTH:	BLOCK	1		;Nonzero: password logins allowed
+TAKLGC:	BLOCK	1		;Nonzero: shells start with TAKE LOGIN.CMD
 CFMAXS:	BLOCK	1		;Most concurrent sessions
 CFLGTO:	BLOCK	1		;Login timeout, seconds (0 = none)
 CFGQ:	BLOCK	1		;Nonzero: no summary line (re-reads)
@@ -57,6 +61,7 @@ CFGRD:	PUSH	P,Q1
 	MOVEI	T1,^D22		;Defaults
 	MOVEM	T1,CFPORT
 	SETOM	PWAUTH
+	SETZM	TAKLGC
 	SETZM	NDIS
 	MOVEI	T1,^D8
 	MOVEM	T1,CFMAXS
@@ -228,6 +233,11 @@ CFGK3:	SETZ	T2,
 	CALL	CFGCMP
 	 SKIPA
 	JRST	CFLTO
+	MOVE	T1,[POINT 7,CFKW]
+	MOVE	T2,[POINT 7,[ASCIZ /LOGIN-CMD/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	CFLGC
 	HRROI	T1,[ASCIZ /unknown keyword/]
 	JRST	CFWARN
 
@@ -350,6 +360,25 @@ CFPWA:	CALL	CFVAL
 	SETZM	PWAUTH
 	RET
 CFBADW:	HRROI	T1,[ASCIZ /PASSWORD-AUTHENTICATION must be YES or NO, ignored/]
+	JRST	CFWARN
+
+;LOGIN-CMD YES or NO
+
+CFLGC:	CALL	CFVAL
+	 JRST	CFBLGC
+	MOVE	T1,[POINT 7,AKTMP]
+	MOVE	T2,[POINT 7,[ASCIZ /YES/]]
+	CALL	CFGCMP
+	 SKIPA
+	JRST	[SETOM	TAKLGC
+		 RET]
+	MOVE	T1,[POINT 7,AKTMP]
+	MOVE	T2,[POINT 7,[ASCIZ /NO/]]
+	CALL	CFGCMP
+	 JRST	CFBLGC
+	SETZM	TAKLGC
+	RET
+CFBLGC:	HRROI	T1,[ASCIZ /LOGIN-CMD must be YES or NO, ignored/]
 	JRST	CFWARN
 
 ;DISABLE-USER name
