@@ -1,5 +1,5 @@
 # tops20-sshd
-SSH deamon for TOPS-20
+SSH daemon for TOPS-20
 
 This projects contains the code	for building and SSH service for the TOPS-20 operating system.
 
