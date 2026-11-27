@@ -52,7 +52,8 @@ SSHCRQ==^D98			;CHANNEL_REQUEST
 SSHCSU==^D99			;CHANNEL_SUCCESS
 SSHCFA==^D100			;CHANNEL_FAILURE
 
-RSIZE==^D4096			;Network ring buffer size (power of 2)
+RSIZE==^D32768			;Network ring buffer size (power of 2)
+RCHNK==^D8192			;Most bytes the reader fork takes in one SIN%
 RMASK==RSIZE-1
 LWINI==^D32768			;Our channel window (8 KB was tried against the
 				; network stalls: much slower, no better)

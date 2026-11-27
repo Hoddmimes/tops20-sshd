@@ -17,7 +17,7 @@
 	INTERN	RINGW,RIX,RMAXP,RPDL,RQW,RTMP,RWIN,RXENC
 	INTERN	SEQI,SEQO,SHELL,SID,SIG,STH,STM,TAG
 	INTERN	TXENC,U4,UNAM,UPSW,VC,VCLEN,VS,VSLEN
-	INTERN	WORK
+	INTERN	WORK,RNB,RSBNO
 
 SUBTTL	Data
 
@@ -55,6 +55,8 @@ RINGR:	BLOCK	1		;Bytes read (main fork)
 NETEOF:	BLOCK	1		;Set by the reader fork at end of stream
 RDRFH:	BLOCK	1		;Reader fork handle
 RPDL:	BLOCK	40		;Reader fork stack
+RNB:	BLOCK	RCHNK/4+1	;Reader fork SIN% buffer (8-bit packed)
+RSBNO:	BLOCK	1		;SIBE% does not work on the TCP JFN
 UNAM:	BLOCK	10		;User name, ASCIZ
 UPSW:	BLOCK	10		;Password, ASCIZ (cleared after use)
 PWA:	BLOCK	1		;Password location in PAY

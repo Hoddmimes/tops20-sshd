@@ -8,6 +8,7 @@
 	EXTERN	NET,NETEOF,OBUF,OLEN,P1305,PAY,PK64,PKT
 	EXTERN	PLEN,R,RING,RINGR,RINGW,RIX,RNDGET,RNDTIM
 	EXTERN	RPDL,RSKP,RXENC,SEQI,SEQO,STH,STM,TAG
+	EXTERN	RNB,RSBNO
 	EXTERN	TXENC,U4,VC,VCLEN
 	INTERN	FLUSH,GETVER,GPSTR,OP32,OPASZ,OPB,OSTR,PUTN
 	INTERN	RCVPKT,RDRFRK,SNDPKT,U4GET,W2U4
@@ -358,8 +359,15 @@ GETN2:	MOVE	T1,RINGR
 ;RDRFRK - the reader fork.  Shares memory with the main fork (CR%MAP).
 ;Reads bytes from the TCP connection into RING; sets NETEOF and halts
 ;at end of stream or on error.
+;
+;One BIN% waits for the next byte; then SIBE% tells how many more bytes
+;have already arrived, and one SIN% takes them all (at most RCHNK, and
+;what fits in the ring).  SIN% is only asked for bytes that are there,
+;so it never waits.  If SIBE% fails on the TCP JFN, RSBNO is set and
+;the fork goes on with one BIN% per byte (slow, but it works).
 
 RDRFRK:	MOVE	P,[IOWD 40,RPDL]
+	SETZM	RSBNO
 RDRF1:	MOVE	T1,RINGW	;Room in the ring?
 	SUB	T1,RINGR
 	CAIGE	T1,RSIZE
@@ -367,13 +375,48 @@ RDRF1:	MOVE	T1,RINGW	;Room in the ring?
 	MOVEI	T1,^D10		;Full: wait for the main fork
 	DISMS%
 	JRST	RDRF1
-RDRF2:	MOVE	T1,NET
+RDRF2:	MOVE	T1,NET		;Wait for the next byte
 	BIN%
 	 ERJMP	RDRF9
 	MOVE	T3,RINGW
 	ANDI	T3,RMASK
 	MOVEM	T2,RING(T3)
 	AOS	RINGW
+	SKIPE	RSBNO		;SIBE% known not to work?
+	 JRST	RDRF1
+	MOVE	T1,NET		;How many more have arrived?
+	SETZ	T2,		;(Stays 0 on the "empty" return)
+	SIBE%
+	 ERJMP	[SETOM	RSBNO	;Not for TCP here: byte at a time
+		 JRST	RDRF1]
+	JUMPLE	T2,RDRF1	;Nothing more
+	CAILE	T2,RCHNK	;At most a buffer full
+	 MOVEI	T2,RCHNK
+	MOVE	T1,RINGW	;and what fits in the ring
+	SUB	T1,RINGR
+	SUBI	T1,RSIZE
+	MOVN	T1,T1		;T1 = free bytes in the ring
+	CAMLE	T2,T1
+	 MOVE	T2,T1
+	JUMPLE	T2,RDRF1
+	MOVE	Q1,T2		;Q1 = bytes asked for
+	MOVE	T1,NET
+	MOVE	T2,[POINT 8,RNB]
+	MOVN	T3,Q1
+	SETZ	Q2,		;Q2 = 0: SIN% worked
+	SIN%
+	 ERJMP	[SETO	Q2,	;Error: keep what was read, then stop
+		 JRST	RDRF2A]
+RDRF2A:	ADD	Q1,T3		;Q1 = bytes actually read (T3 = -left)
+	MOVE	T2,[POINT 8,RNB]
+RDRF3:	SOJL	Q1,RDRF4	;Into the ring
+	ILDB	T4,T2
+	MOVE	T1,RINGW
+	ANDI	T1,RMASK
+	MOVEM	T4,RING(T1)
+	AOS	RINGW
+	JRST	RDRF3
+RDRF4:	JUMPN	Q2,RDRF9
 	JRST	RDRF1
 RDRF9:	SETOM	NETEOF
 	HALTF%
