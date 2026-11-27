@@ -5,6 +5,12 @@ This projects contains the code	for building and SSH service for the TOPS-20 ope
 
 ### How	to build (on TOPS-20)
 
+The script BUILD.CMD will compile and build the SSHD and the SSHRUN executables
+```
+@TAKE BUILD.CMD
+```
+
+
 - All code i.e.	*.MAC should be	located	in one directory
 -  The following commands will compile and build the SSHD.EXE 
 
@@ -22,10 +28,7 @@ This projects contains the code	for building and SSH service for the TOPS-20 ope
 @SAVE SSHRUN
 ```
 
-The script BUILD.CMD will compile and build the SSHD and the SSHRUN executables
-```
-@TAKE BUILD.CMD
-```
+
 
 
 
