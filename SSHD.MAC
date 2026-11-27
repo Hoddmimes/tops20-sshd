@@ -29,7 +29,7 @@ START:	RESET%
 	MOVE	P,[IOWD PDLEN,PDL]
 	CALL	LOGINI		;Output to SSHD.LOG
 	TMSG	<
-TOPS-20 SSH server phase 5 - login and shell
+TOPS-20 SSH server
 >
 	CALL	CFGRD		;Read SSHD.CFG
 	CALL	RNDINI		;Seed the random pool

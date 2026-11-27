@@ -14,7 +14,7 @@
 ;blank lines and lines starting with ; ! or # are ignored:
 ;
 ;	PORT 22				TCP port to listen on
-;	AUTHORIZED-KEYS SSH-AUTHORIZED-KEYS.TXT
+;	AUTHORIZED-KEYS SSH-AUTH-KEYS.TXT
 ;					file in each user's login
 ;					directory with SSH public keys
 ;	PASSWORD-AUTHENTICATION NO	only key logins (default YES)
@@ -23,7 +23,7 @@
 ;	MAX-SESSIONS 8			concurrent sessions (1-16)
 ;	LOGIN-TIMEOUT 120		seconds to log in (0 = no limit)
 ;
-;Missing file or bad lines: defaults (port 22, SSH-AUTHORIZED-KEYS.TXT,
+;Missing file or bad lines: defaults (port 22, SSH-AUTH-KEYS.TXT,
 ;passwords allowed, no disabled users) and a %SSHD.CFG warning in the
 ;log.  The key file must be a plain
 ;file name (letters, digits, - . _ $), so it is always looked up as
@@ -63,7 +63,7 @@ CFGRD:	PUSH	P,Q1
 	MOVEI	T1,^D120
 	MOVEM	T1,CFLGTO
 	HRROI	T1,AKNAM
-	HRROI	T2,[ASCIZ /SSH-AUTHORIZED-KEYS.TXT/]
+	HRROI	T2,[ASCIZ /SSH-AUTH-KEYS.TXT/]
 	SETZ	T3,
 	SOUT%
 	IDPB	T3,T1

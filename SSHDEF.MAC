@@ -57,8 +57,8 @@ RMASK==RSIZE-1
 LWINI==^D32768			;Our channel window (8 KB was tried against the
 				; network stalls: much slower, no better)
 LMAXP==^D32768			;Largest channel packet we accept
-FTSCP==0			;1: classic scp (module SSHSCP; add it to the
-				; LOAD in tools/build.py).  0: no scp.
+FTSCP==1			;1: classic scp (module SSHSCP; add it to the
+				; LOAD in BUILD.CMD).  0: no scp.
 SMAX==^D16			;Most concurrent sessions (MAX-SESSIONS limit)
 PCHUNK==^D1024			;Largest PTY output chunk we send
 

@@ -10,7 +10,7 @@ This projects contains the code	for building and SSH service for the TOPS-20 ope
 
 ```
 @COMPILE SSHDEF
-@LOAD /COMPILE SSHD,SSHDAT,SSHKEX,SSHPKT,SSHCON,SSHLOG,SSHCFG,SSHKEY,SSHUTL,CHACHA,POLY,FE255,X25519,SC255,ED255,EDCON,RSA,SHA2,SHAK
+@LOAD /COMPILE SSHD,SSHDAT,SSHKEX,SSHPKT,SSHCON,SSHLOG,SSHCFG,SSHKEY,SSHUTL,SSHSCP,CHACHA,POLY,FE255,X25519,SC255,ED255,EDCON,RSA,SHA2,SHAK
 @SAVE SSHD
 ```
 
@@ -80,6 +80,23 @@ RUN PS:<SSHD>SSHRUN
 "
 ```
 
+
+### File transfer with scp
+The SSHD supports the classic scp protocol (enabled with FTSCP==1 in SSHDEF.MAC,
+which is the default). SFTP is not supported, so OpenSSH 9.0 and later must use
+the -O option:
+
+```
+scp -O myfile.txt user@tops20host:
+scp -O user@tops20host:LOGIN.CMD .
+scp -O 'user@tops20host:*.MAC' .
+```
+
+- Plain names and "." are relative to the user's PS:<user> directory; names are upper-cased
+- Text (7-bit) files are converted CRLF <-> LF; 8-bit files are copied as is
+- 36-bit files (.EXE, .REL ...) and directories (scp -r) are refused
+- Wildcards work for downloads
+- File access is checked as the logged-in user
 
 ### User Authorized SSH Keys
 The setting _AUTHORIZED-KEYS_ in the SSHD.CFG will point out the file where the SSHD server will try to locate the SSH keys being authorized for the user. The file must be located the the user top directory.

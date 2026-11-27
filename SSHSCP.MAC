@@ -1,7 +1,7 @@
 	TITLE	SSHSCP - TOPS-20 SSH server: scp (classic protocol)
 
 ;Only assembled into the server with FTSCP==1 in SSHDEF (and SSHSCP in
-;the LOAD list of tools/build.py); FTSCP==0 leaves scp out entirely.
+;the LOAD list in BUILD.CMD); FTSCP==0 leaves scp out entirely.
 ;
 ;Classic scp: "scp -O" with OpenSSH 9.0 and later (which otherwise use
 ;SFTP, not supported), plain scp with older OpenSSH, pscp.  The client
